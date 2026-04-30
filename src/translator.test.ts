@@ -300,6 +300,81 @@ describe('toAcpPrompt - thinking and special blocks', () => {
     expect(textBlocks).toEqual([{ type: 'text', text: 'visible message' }])
   })
 
+  it('drops synthesized kiro_* tool_use blocks from replayed history', () => {
+    const inputRequest: AnthropicRequest = {
+      model: 'kiro',
+      messages: [{
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Editing file.' },
+          { type: 'tool_use', id: 'toolu_synth1', name: 'kiro_Edit', input: { file_path: 'a.ts', old_string: 'x', new_string: 'y' } } as never,
+          { type: 'text', text: 'Done.' },
+        ],
+      }],
+      max_tokens: 1024,
+    }
+    const actualBlocks = toAcpPrompt(inputRequest, true)
+    const allText = actualBlocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('|')
+    expect(allText).not.toContain('kiro_Edit')
+    expect(allText).not.toContain('toolu_synth1')
+  })
+
+  it('drops paired tool_result for synthesized kiro_* tool_use', () => {
+    const inputRequest: AnthropicRequest = {
+      model: 'kiro',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'tool_use', id: 'toolu_synth1', name: 'kiro_Bash', input: { command: 'ls' } } as never,
+          { type: 'tool_result', tool_use_id: 'toolu_synth1', content: 'fake output' },
+          { type: 'text', text: 'real user message' },
+        ],
+      }],
+      max_tokens: 1024,
+    }
+    const actualBlocks = toAcpPrompt(inputRequest, true)
+    const allText = actualBlocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('|')
+    expect(allText).not.toContain('toolu_synth1')
+    expect(allText).not.toContain('fake output')
+    expect(allText).toContain('real user message')
+  })
+
+  it('drops tool_result with "No such tool: kiro_" error even without paired tool_use', () => {
+    const inputRequest: AnthropicRequest = {
+      model: 'kiro',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_lost', content: 'No such tool: kiro_Bash' },
+          { type: 'text', text: 'continue' },
+        ],
+      }],
+      max_tokens: 1024,
+    }
+    const actualBlocks = toAcpPrompt(inputRequest, true)
+    const allText = actualBlocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('|')
+    expect(allText).not.toContain('No such tool')
+    expect(allText).toContain('continue')
+  })
+
+  it('keeps real (non-kiro_) tool_use and tool_result pairs', () => {
+    const inputRequest: AnthropicRequest = {
+      model: 'kiro',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'tool_use', id: 'toolu_real', name: 'WebSearch', input: { query: 'foo' } } as never,
+          { type: 'tool_result', tool_use_id: 'toolu_real', content: 'search result' },
+        ],
+      }],
+      max_tokens: 1024,
+    }
+    const actualBlocks = toAcpPrompt(inputRequest, true)
+    const allText = actualBlocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('|')
+    expect(allText).toContain('WebSearch')
+    expect(allText).toContain('search result')
+  })
+
   it('handles tool_use blocks in content by JSON-stringifying', () => {
     const inputRequest: AnthropicRequest = {
       model: 'kiro',

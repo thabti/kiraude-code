@@ -249,11 +249,54 @@ const findLastUserMessage = (messages: ReadonlyArray<AnthropicMessage>): Anthrop
   return null
 }
 
+const KIRO_TOOL_PREFIX = 'kiro_'
+const NO_SUCH_TOOL_PATTERN = /No such tool(?: available)?:\s*kiro_/i
+
+const tool_resultText = (block: AnthropicToolResultBlock): string =>
+  typeof block.content === 'string'
+    ? block.content
+    : block.content.map((b) => b.text).join('\n')
+
+/**
+ * Returns the set of tool_use IDs that came from synthesized kiro_* tools
+ * (which the client cannot execute). Also includes IDs whose paired
+ * tool_result error indicates "No such tool: kiro_*", in case the original
+ * tool_use block was already filtered upstream.
+ */
+const collectSynthesizedIds = (content: ReadonlyArray<AnthropicContentBlock>): Set<string> => {
+  const ids = new Set<string>()
+  for (const block of content) {
+    if (block.type === 'tool_use' && typeof block.name === 'string' && block.name.startsWith(KIRO_TOOL_PREFIX)) {
+      ids.add(block.id)
+    }
+    if (block.type === 'tool_result') {
+      const text = tool_resultText(block)
+      if (NO_SUCH_TOOL_PATTERN.test(text)) {
+        ids.add(block.tool_use_id)
+      }
+    }
+  }
+  return ids
+}
+
 const convertMessageContent = (content: string | ReadonlyArray<AnthropicContentBlock>): Array<ContentBlock> => {
   if (typeof content === 'string') {
     return [{ type: 'text', text: content }]
   }
-  return content.map(convertSingleBlock).filter((b) => b.type !== 'text' || (b as { text: string }).text.length > 0)
+  // Filter out synthesized kiro_* tool_use blocks and their tool_result pairs
+  // before conversion. They were emitted by the proxy for display only — kiro
+  // already executed the underlying action; replaying them would confuse it.
+  const synthIds = collectSynthesizedIds(content)
+  const filtered = content.filter((block) => {
+    if (block.type === 'tool_use' && typeof block.name === 'string' && block.name.startsWith(KIRO_TOOL_PREFIX)) {
+      return false
+    }
+    if (block.type === 'tool_result' && synthIds.has(block.tool_use_id)) {
+      return false
+    }
+    return true
+  })
+  return filtered.map(convertSingleBlock).filter((b) => b.type !== 'text' || (b as { text: string }).text.length > 0)
 }
 
 const convertSingleBlock = (block: AnthropicContentBlock): ContentBlock => {
