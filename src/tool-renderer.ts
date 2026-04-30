@@ -157,7 +157,8 @@ const buildRichTitle = (call: ToolCallStartLike, baseDir: string): string => {
   if (kind === 'execute' && raw) {
     const cmd = raw['command'] as string | undefined
     if (cmd) {
-      const trimmed = cmd.length > 80 ? cmd.slice(0, 77) + '…' : cmd
+      const relCmd = relativizePathsInTitle(cmd, baseDir)
+      const trimmed = relCmd.length > 80 ? relCmd.slice(0, 77) + '…' : relCmd
       return `Bash ${trimmed}`
     }
   }
