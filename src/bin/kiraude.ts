@@ -47,13 +47,25 @@ const startServer = async (): Promise<void> => {
   app.use(createModelsRouter())
   app.use(createBootstrapRouter())
 
-  await pool.init()
   sessionManager.startCleanup()
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const server = createServer(app)
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`\nPort ${PORT} is already in use.\n`)
+        console.error(`  Kill the existing process:  kill $(lsof -ti:${PORT})`)
+        console.error(`  Or use a different port:    npx kiraude -p ${PORT + 1}\n`)
+        process.exit(1)
+      }
+      reject(err)
+    })
     server.listen(PORT, () => {
-      resolve()
+      printBanner(PORT, POOL_SIZE)
+      pool.init().then(() => resolve()).catch((err) => {
+        console.error('Pool init failed:', err)
+        process.exit(1)
+      })
     })
 
     const shutdown = async (): Promise<void> => {
@@ -68,15 +80,7 @@ const startServer = async (): Promise<void> => {
 }
 
 const main = async (): Promise<void> => {
-  console.log(`Starting kiraude proxy on port ${PORT}...`)
   await startServer()
-  printBanner(PORT, POOL_SIZE)
-
-  console.log('')
-  console.log('Run Claude Code against this proxy:')
-  console.log('')
-  console.log(`  ANTHROPIC_BASE_URL=http://localhost:${PORT} ANTHROPIC_API_KEY=sk-ant-dummy claude`)
-  console.log('')
 }
 
 main().catch((err) => {
