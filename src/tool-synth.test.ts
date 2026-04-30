@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { synthesizeToolUse, synthesizeInput, isEmulateEnabled, NAME_BY_KIND } from './tool-synth.js'
+import { synthesizeToolUse, synthesizeInput, isEmulateEnabled, NAME_BY_KIND, stableToolUseId } from './tool-synth.js'
 import type { ToolCallStartLike } from './tool-renderer.js'
 
 const restore = (key: string, prev: string | undefined): void => {
@@ -60,6 +60,31 @@ describe('synthesizeToolUse', () => {
     const call: ToolCallStartLike = { toolCallId: 't', kind: 'edit' }
     const result = synthesizeToolUse(call, 'toolu_specific')
     expect(result?.toolUseId).toBe('toolu_specific')
+  })
+
+  it('derives stable toolUseId from toolCallId when not provided', () => {
+    const call: ToolCallStartLike = { toolCallId: 'kiro-tc-123', kind: 'edit' }
+    const a = synthesizeToolUse(call)
+    const b = synthesizeToolUse(call)
+    expect(a?.toolUseId).toBe(b?.toolUseId)
+    expect(a?.toolUseId.startsWith('toolu_')).toBe(true)
+    expect(a?.toolUseId.length).toBe(30) // toolu_ + 24 hex
+  })
+
+  it('different toolCallIds produce different toolUseIds', () => {
+    const a = synthesizeToolUse({ toolCallId: 'a', kind: 'edit' })
+    const b = synthesizeToolUse({ toolCallId: 'b', kind: 'edit' })
+    expect(a?.toolUseId).not.toBe(b?.toolUseId)
+  })
+})
+
+describe('stableToolUseId', () => {
+  it('is deterministic', () => {
+    expect(stableToolUseId('foo')).toBe(stableToolUseId('foo'))
+  })
+  it('produces toolu_ prefix with 24 hex chars', () => {
+    const id = stableToolUseId('any-acp-id')
+    expect(id).toMatch(/^toolu_[0-9a-f]{24}$/)
   })
 })
 

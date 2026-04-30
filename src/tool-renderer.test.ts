@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { renderToolCallStart, renderToolCallUpdate, renderPlan, renderDiff, formatHeader } from './tool-renderer.js'
+import { renderToolCallStart, renderToolCallUpdate, renderPlan, renderDiff, formatHeader, buildRichTitle } from './tool-renderer.js'
 import type { ToolCallStartLike, ToolCallState } from './tool-renderer.js'
 
 describe('renderToolCallStart', () => {
@@ -145,5 +145,79 @@ describe('formatHeader', () => {
   it('uses kind icon when provided', () => {
     expect(formatHeader({ toolCallId: 't', title: 'X', kind: 'edit' })).toContain('✏️')
     expect(formatHeader({ toolCallId: 't', title: 'X', kind: 'execute' })).toContain('🖥️')
+  })
+})
+
+describe('buildRichTitle', () => {
+  it('renders Read with offset+limit range', () => {
+    const out = buildRichTitle({
+      toolCallId: 't',
+      kind: 'read',
+      title: 'Read',
+      rawInput: { file_path: '/proj/a.ts', offset: 10, limit: 20 },
+    }, '/proj')
+    expect(out).toBe('Read a.ts (10-30)')
+  })
+
+  it('renders Edit with relative path', () => {
+    const out = buildRichTitle({
+      toolCallId: 't',
+      kind: 'edit',
+      title: 'kiro title',
+      rawInput: { file_path: '/proj/src/foo.ts' },
+    }, '/proj')
+    expect(out).toBe('Edit src/foo.ts')
+  })
+
+  it('renders Bash with command (truncates long)', () => {
+    const out = buildRichTitle({
+      toolCallId: 't',
+      kind: 'execute',
+      title: '',
+      rawInput: { command: 'npm test' },
+    }, '/proj')
+    expect(out).toBe('Bash npm test')
+  })
+
+  it('renders Grep with pattern + path', () => {
+    const out = buildRichTitle({
+      toolCallId: 't',
+      kind: 'search',
+      title: '',
+      rawInput: { pattern: 'TODO', path: '/proj/src' },
+    }, '/proj')
+    expect(out).toBe('Grep "TODO" in src')
+  })
+
+  it('falls back to title when rawInput lacks structure', () => {
+    const out = buildRichTitle({
+      toolCallId: 't',
+      kind: 'other',
+      title: 'Whatever',
+    }, '/proj')
+    expect(out).toBe('Whatever')
+  })
+
+  it('relativizes absolute paths inside fallback title', () => {
+    const out = buildRichTitle({
+      toolCallId: 't',
+      kind: 'other',
+      title: 'Did /proj/x.ts and /proj/y.ts',
+    }, '/proj')
+    expect(out).toBe('Did x.ts and y.ts')
+  })
+})
+
+describe('renderPlan with priorities', () => {
+  it('marks high priority entries', () => {
+    const out = renderPlan([
+      { content: 'Critical fix', status: 'pending', priority: 'high' },
+      { content: 'Polish', status: 'pending', priority: 'low' },
+      { content: 'Routine', status: 'pending' },
+    ])
+    expect(out).toContain('Critical fix 🔥')
+    expect(out).toContain('Polish ▽')
+    // medium / unspecified gets no marker
+    expect(out).toMatch(/\[ \] Routine\n/)
   })
 })

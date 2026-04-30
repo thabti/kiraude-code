@@ -1,5 +1,6 @@
 import * as path from 'node:path'
 import type { SessionUpdate } from '@agentclientprotocol/sdk'
+import { markdownFence } from './utils.js'
 
 interface Diff {
   readonly path: string
@@ -51,12 +52,9 @@ const truncate = (text: string, max: number): string => {
 const renderDiff = (path: string, oldText: string | null | undefined, newText: string): string => {
   const oldLines = (oldText ?? '').split('\n')
   const newLines = newText.split('\n')
-  const lines: string[] = []
-  lines.push('```diff')
-  lines.push(`--- ${path}`)
-  lines.push(`+++ ${path}`)
-  // Naive whole-file diff: omit unchanged tail/head, mark differences.
-  // Good enough for visual feedback; CC's UI only needs textual diff.
+  const body: string[] = []
+  body.push(`--- ${path}`)
+  body.push(`+++ ${path}`)
   let i = 0
   let j = 0
   const maxLines = 200
@@ -65,24 +63,23 @@ const renderDiff = (path: string, oldText: string | null | undefined, newText: s
     const o = oldLines[i]
     const n = newLines[j]
     if (o === n) {
-      lines.push(` ${o ?? ''}`)
+      body.push(` ${o ?? ''}`)
       i++; j++
     } else {
       if (i < oldLines.length) {
-        lines.push(`-${o ?? ''}`)
+        body.push(`-${o ?? ''}`)
         i++; emitted++
       }
       if (j < newLines.length) {
-        lines.push(`+${n ?? ''}`)
+        body.push(`+${n ?? ''}`)
         j++; emitted++
       }
     }
   }
   if (i < oldLines.length || j < newLines.length) {
-    lines.push(`… [diff truncated, ${oldLines.length - i} old / ${newLines.length - j} new lines remaining]`)
+    body.push(`… [diff truncated, ${oldLines.length - i} old / ${newLines.length - j} new lines remaining]`)
   }
-  lines.push('```')
-  return lines.join('\n')
+  return markdownFence(body.join('\n'), 'diff')
 }
 
 const renderContentBlocks = (
@@ -103,10 +100,8 @@ const renderContentBlocks = (
     if (c.type === 'content' && c.content) {
       const inner = c.content
       if (inner.type === 'text' && typeof inner.text === 'string') {
-        const fence = kind === 'execute' ? 'bash' : ''
-        parts.push('```' + fence)
-        parts.push(truncate(inner.text, 4000))
-        parts.push('```')
+        const lang = kind === 'execute' ? 'bash' : ''
+        parts.push(markdownFence(truncate(inner.text, 4000), lang))
         continue
       }
     }
@@ -122,13 +117,77 @@ const relPath = (p: string, baseDir: string): string => {
   return rel || '.'
 }
 
+/** Replace any absolute paths inside a free-form title with relative paths. */
+const relativizePathsInTitle = (title: string, baseDir: string): string => {
+  return title.replace(/(\/[A-Za-z0-9_./-]+)/g, (m) => relPath(m, baseDir))
+}
+
+/**
+ * Build a rich header label from kind + rawInput, mirroring claude-agent-acp's
+ * label conventions. Falls back to kiro's title when rawInput lacks structure.
+ */
+const buildRichTitle = (call: ToolCallStartLike, baseDir: string): string => {
+  const baseTitle = call.title ?? ''
+  const raw = (call.rawInput && typeof call.rawInput === 'object')
+    ? call.rawInput as Record<string, unknown>
+    : null
+  const kind = call.kind ?? 'other'
+
+  if (kind === 'read' && raw) {
+    const filePath = (raw['file_path'] ?? raw['path']) as string | undefined
+    const offset = raw['offset'] as number | undefined
+    const limit = raw['limit'] as number | undefined
+    if (filePath) {
+      const rel = relPath(filePath, baseDir)
+      if (offset != null && limit != null) {
+        return `Read ${rel} (${offset}-${offset + limit})`
+      }
+      if (offset != null) return `Read ${rel} (from ${offset})`
+      return `Read ${rel}`
+    }
+  }
+  if ((kind === 'edit' || kind === 'delete' || kind === 'move') && raw) {
+    const filePath = raw['file_path'] as string | undefined
+    if (filePath) {
+      const rel = relPath(filePath, baseDir)
+      const verb = kind === 'edit' ? 'Edit' : kind === 'delete' ? 'Delete' : 'Move'
+      return `${verb} ${rel}`
+    }
+  }
+  if (kind === 'execute' && raw) {
+    const cmd = raw['command'] as string | undefined
+    if (cmd) {
+      const trimmed = cmd.length > 80 ? cmd.slice(0, 77) + '…' : cmd
+      return `Bash ${trimmed}`
+    }
+  }
+  if (kind === 'search' && raw) {
+    const pattern = raw['pattern'] as string | undefined
+    const searchPath = raw['path'] as string | undefined
+    if (pattern) {
+      const where = searchPath ? ` in ${relPath(searchPath, baseDir)}` : ''
+      return `Grep "${pattern}"${where}`
+    }
+    const glob = raw['glob'] as string | undefined
+    if (glob) return `Glob ${glob}`
+  }
+  if (kind === 'fetch' && raw) {
+    const url = raw['url'] as string | undefined
+    if (url) return `Fetch ${url}`
+    const query = raw['query'] as string | undefined
+    if (query) return `WebSearch "${query}"`
+  }
+  return relativizePathsInTitle(baseTitle, baseDir)
+}
+
 const formatHeader = (call: ToolCallStartLike, baseDir: string = process.cwd()): string => {
   const icon = ICONS[call.kind ?? 'other'] ?? '⏺'
-  const title = call.title ?? '(tool)'
+  const title = buildRichTitle(call, baseDir) || '(tool)'
   if (call.locations && call.locations.length > 0) {
     const loc = call.locations[0]!
     const cleanPath = relPath(loc.path, baseDir)
     const where = loc.line != null ? `${cleanPath}:${loc.line}` : cleanPath
+    if (title.includes(cleanPath)) return `${icon} ${title}`
     return `${icon} ${title} — ${where}`
   }
   return `${icon} ${title}`
@@ -222,7 +281,11 @@ const renderPlan = (entries: ReadonlyArray<{ content: string; status: string; pr
   lines.push('\n📋 **Plan**')
   for (const e of entries) {
     const box = e.status === 'completed' ? '[x]' : e.status === 'in_progress' ? '[~]' : '[ ]'
-    lines.push(`- ${box} ${e.content}`)
+    // Mirror claude-agent-acp: missing priority defaults to "medium"; only
+    // surface the marker when not the default to avoid clutter.
+    const priority = e.priority ?? 'medium'
+    const prMark = priority === 'high' ? ' 🔥' : priority === 'low' ? ' ▽' : ''
+    lines.push(`- ${box} ${e.content}${prMark}`)
   }
   return lines.join('\n') + '\n'
 }
@@ -241,5 +304,7 @@ export {
   isToolCallStart,
   isToolCallUpdate,
   formatHeader,
+  buildRichTitle,
+  relPath,
 }
 export type { ToolCallStartLike, ToolCallUpdateLike, ToolCallState, ToolContentBlock }

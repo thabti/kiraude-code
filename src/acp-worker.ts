@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import * as acp from '@agentclientprotocol/sdk'
+import { loadMcpServers } from './mcp-config.js'
 import type {
   SessionNotification,
   RequestPermissionRequest,
@@ -165,7 +166,7 @@ class AcpWorker {
   async createSession(cwd: string): Promise<string> {
     if (!this.connection) throw new Error(`Worker ${this.id} not initialized`)
     if (this.state === 'dead') throw new Error(`Worker ${this.id} is dead`)
-    const result = await this.connection.newSession({ cwd, mcpServers: [] })
+    const result = await this.connection.newSession({ cwd, mcpServers: loadMcpServers() })
     const slot: SessionSlot = {
       acpSessionId: result.sessionId,
       cwd,
@@ -341,14 +342,25 @@ class AcpWorker {
         const content = await fs.readFile(params.path, 'utf-8')
         if (params.line != null || params.limit != null) {
           const lines = content.split('\n')
-          const startLine = (params.line ?? 1) - 1
-          const endLine = params.limit != null ? startLine + params.limit : lines.length
+          // Bounds-check: ACP line is 1-based; clamp to [1, lines.length+1].
+          // Negative or zero line → start from beginning. Limit ≤ 0 → no slicing.
+          const requestedLine = params.line ?? 1
+          const startLine = Math.max(0, Math.min(lines.length, requestedLine - 1))
+          if (params.limit != null && params.limit <= 0) {
+            return { content: '' }
+          }
+          const endLine = params.limit != null
+            ? Math.min(lines.length, startLine + params.limit)
+            : lines.length
           return { content: lines.slice(startLine, endLine).join('\n') }
         }
         return { content }
       },
       writeTextFile: async (params: WriteTextFileRequest): Promise<WriteTextFileResponse> => {
-        await fs.writeFile(params.path, params.content, 'utf-8')
+        // Normalize CRLF → LF (some Claude clients send Windows line endings,
+        // which would break tools expecting Unix EOL).
+        const normalized = params.content.replace(/\r\n/g, '\n')
+        await fs.writeFile(params.path, normalized, 'utf-8')
         return {}
       },
       createTerminal: (params: CreateTerminalRequest): Promise<CreateTerminalResponse> => {

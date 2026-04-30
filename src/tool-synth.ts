@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import type { ToolCallStartLike, ToolContentBlock } from './tool-renderer.js'
 
 /**
@@ -103,12 +104,24 @@ const synthesizeInput = (call: ToolCallStartLike): Record<string, unknown> => {
   return { _title: call.title ?? '', ...rawInput }
 }
 
+/**
+ * Derive a stable Anthropic tool_use.id from an ACP toolCallId.
+ * Same kiro toolCallId always maps to the same tool_use.id, so subsequent
+ * tool_call_update emissions reuse the same id (per Anthropic spec, the id
+ * pairs tool_use ↔ tool_result across turns).
+ */
+const stableToolUseId = (acpToolCallId: string): string => {
+  const hash = crypto.createHash('sha256').update(acpToolCallId).digest('hex')
+  return `toolu_${hash.slice(0, 24)}`
+}
+
 /** Build a SynthesizedToolUse for a tool_call (returns null if disabled). */
-const synthesizeToolUse = (call: ToolCallStartLike, toolUseId: string): SynthesizedToolUse | null => {
+const synthesizeToolUse = (call: ToolCallStartLike, toolUseId?: string): SynthesizedToolUse | null => {
   if (!isEmulateEnabled()) return null
   const name = NAME_BY_KIND[call.kind ?? 'other'] ?? 'kiro_Tool'
   const input = synthesizeInput(call)
-  return { toolUseId, name, input }
+  const id = toolUseId ?? stableToolUseId(call.toolCallId)
+  return { toolUseId: id, name, input }
 }
 
 const findDiff = (content: ReadonlyArray<ToolContentBlock>): { path: string; oldText: string | null; newText: string } | null => {
@@ -129,5 +142,5 @@ const findText = (content: ReadonlyArray<ToolContentBlock>): string | null => {
   return null
 }
 
-export { synthesizeToolUse, synthesizeInput, isEmulateEnabled, NAME_BY_KIND }
+export { synthesizeToolUse, synthesizeInput, isEmulateEnabled, NAME_BY_KIND, stableToolUseId }
 export type { SynthesizedToolUse }

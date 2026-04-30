@@ -268,7 +268,9 @@ const handleStreaming = async (
   const emitSynthForCall = async (call: ToolCallStartLike | ToolCallUpdateLike): Promise<void> => {
     if (!emulate) return
     const prev = synthBlocks.get(call.toolCallId)
-    const synth = synthesizeToolUse(call as ToolCallStartLike, prev?.toolUseId ?? `toolu_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`)
+    // stableToolUseId derives a deterministic id from acp toolCallId, so
+    // synthesizeToolUse without an explicit override returns the same id on every call.
+    const synth = synthesizeToolUse(call as ToolCallStartLike, prev?.toolUseId)
     if (!synth) return
     const json = JSON.stringify(synth.input)
     if (prev && prev.lastJson === json) return

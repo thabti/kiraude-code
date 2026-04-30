@@ -4,7 +4,6 @@ import { buildPersonaPrefix } from './persona.js'
 import { renderToolCallStart, renderToolCallUpdate, renderPlan, type ToolCallState, type ToolCallStartLike, type ToolCallUpdateLike } from './tool-renderer.js'
 import { buildRecap } from './recap.js'
 import { synthesizeToolUse, isEmulateEnabled } from './tool-synth.js'
-import crypto2 from 'node:crypto'
 
 interface AnthropicMessage {
   readonly role: string
@@ -391,10 +390,11 @@ const toAnthropicMessage = (
     content.push({ type: 'text', text: combinedText })
   }
   // Synthesize tool_use blocks per call (EMULATE_CC_TOOLS, default on).
+  // Uses stableToolUseId derived from ACP toolCallId so a multi-turn
+  // conversation correlates the same tool across repeated emissions.
   if (isEmulateEnabled()) {
-    for (const [id, snapshot] of toolCallSnapshots) {
-      const toolUseId = `toolu_${crypto2.randomUUID().replace(/-/g, '').slice(0, 24)}`
-      const synth = synthesizeToolUse(snapshot, toolUseId)
+    for (const snapshot of toolCallSnapshots.values()) {
+      const synth = synthesizeToolUse(snapshot)
       if (!synth) continue
       content.push({
         type: 'tool_use',
@@ -402,7 +402,6 @@ const toAnthropicMessage = (
         name: synth.name,
         input: synth.input,
       })
-      void id
     }
   }
 
@@ -429,6 +428,10 @@ const mapStopReason = (acpReason: string, hasToolUse: boolean): string => {
   if (hasToolUse) return 'tool_use'
   if (acpReason === 'end_turn') return 'end_turn'
   if (acpReason === 'max_tokens') return 'max_tokens'
+  // ACP "cancelled" stop reason: closest Anthropic equivalent is end_turn
+  // (Anthropic spec has no cancelled). Caller may surface as SSE error if needed.
+  if (acpReason === 'cancelled') return 'end_turn'
+  if (acpReason === 'refusal') return 'refusal'
   return 'end_turn'
 }
 

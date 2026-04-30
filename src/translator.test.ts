@@ -33,6 +33,14 @@ describe('mapStopReason', () => {
   it('defaults to end_turn for unknown reasons', () => {
     expect(mapStopReason('something_else', false)).toBe('end_turn')
   })
+
+  it('maps cancelled to end_turn', () => {
+    expect(mapStopReason('cancelled', false)).toBe('end_turn')
+  })
+
+  it('maps refusal to refusal', () => {
+    expect(mapStopReason('refusal', false)).toBe('refusal')
+  })
 })
 
 describe('toAcpPrompt', () => {
