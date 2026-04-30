@@ -1,0 +1,29 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Test artifacts
+*.test.d.ts
+*.test.d.ts.map
+*.test.js.map
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.*
+
+# Internal / personal
+claudekiro.md
+ralph-*
+activity.md
+CLAUDE.md
+.kiro/
