@@ -13,7 +13,10 @@ import { printBanner } from '../banner.js'
 import createBootstrapRouter from '../routes/bootstrap.js'
 import rateLimitHeaders from '../middleware/rate-limit-headers.js'
 
-const PORT = parseInt(process.env['PORT'] ?? '3456', 10)
+const portArgIdx = process.argv.indexOf('--port')
+const portArg = portArgIdx !== -1 ? process.argv[portArgIdx + 1] : undefined
+const PORT = parseInt(portArg ?? process.env['PORT'] ?? '3456', 10)
+if (portArgIdx !== -1) process.argv.splice(portArgIdx, 2)
 const POOL_SIZE = parseInt(process.env['POOL_SIZE'] ?? '2', 10)
 const KIRO_CLI_PATH = process.env['KIRO_CLI_PATH'] ?? 'kiro-cli'
 

@@ -17,7 +17,6 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "npm run build",
-    "prepare": "npm run build",
     "release": "bash scripts/release.sh"
   },
   "keywords": [
@@ -38,9 +37,9 @@
     "type": "git",
     "url": "git+https://github.com/thabti/kiraude-code.git"
   },
-  "homepage": "https://github.com/sabeur/kiraude#readme",
+  "homepage": "https://github.com/thabti/kiraude-code#readme",
   "bugs": {
-    "url": "https://github.com/sabeur/kiraude/issues"
+    "url": "https://github.com/thabti/kiraude-code/issues"
   },
   "engines": {
     "node": ">=18"
