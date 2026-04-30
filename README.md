@@ -92,7 +92,7 @@ npx kiraude --print "explain this codebase"
 Start the server and point any Anthropic SDK client at it:
 
 ```bash
-git clone https://github.com/sabeur/kiraude.git
+git clone https://github.com/thabti/kiraude.git
 cd kiraude
 npm install
 npm run dev
