@@ -1,6 +1,4 @@
-# kiraude
 
-```
   ██╗  ██╗██╗██████╗  █████╗ ██╗   ██╗██████╗ ███████╗
   ██║ ██╔╝██║██╔══██╗██╔══██╗██║   ██║██╔══██╗██╔════╝
   █████╔╝ ██║██████╔╝███████║██║   ██║██║  ██║█████╗
@@ -8,7 +6,7 @@
   ██║  ██╗██║██║  ██║██║  ██║╚██████╔╝██████╔╝███████╗
   ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝
                                                   v0.1.0
-```
+
 
 Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) powered by [Kiro CLI](https://kiro.dev). One command, zero config.
 
@@ -275,16 +273,6 @@ pm2 logs kiraude    # tail logs
 ```bash
 curl -s http://localhost:3456/health | jq .
 ```
-
-## CC tool emulation
-
-When `EMULATE_CC_TOOLS=true` (default), the proxy synthesizes Anthropic `tool_use` blocks for every kiro ACP `tool_call`. Tool names are prefixed `kiro_*` (e.g. `kiro_Edit`, `kiro_Bash`, `kiro_Read`) so Claude Code renders rich diffs and file edits without re-executing the action — kiro already ran it.
-
-A parallel text-rendered block (formatted diff, fenced bash output) is also emitted for immediate visual feedback.
-
-`TodoWrite` is emitted un-prefixed since it is a no-op state writer safe to execute client-side.
-
-Set `EMULATE_CC_TOOLS=false` for plain text rendering only.
 
 ## Security
 
