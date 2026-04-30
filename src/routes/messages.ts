@@ -18,6 +18,8 @@ import {
   type ToolCallStartLike,
   type ToolCallUpdateLike,
 } from '../tool-renderer.js'
+import { clientHasTodoWrite, planToTodos, buildRecap } from '../recap.js'
+import { synthesizeToolUse, isEmulateEnabled } from '../tool-synth.js'
 import type AcpPool from '../pool.js'
 import type SessionManager from '../session-manager.js'
 import type { Lease } from '../pool.js'
@@ -110,6 +112,7 @@ const handleNonStreaming = async (
     const response = toAnthropicMessage(collected, promptResponse, anthropicRequest, {
       inputTokens,
       cacheHit: cacheHit ? { prefixTokens: cacheHit.prefixTokens } : null,
+      baseDir: cwd,
     })
     timings.translateMs = Date.now() - translateStart
     logger.info({
@@ -175,9 +178,18 @@ const handleStreaming = async (
   let lastChunkAt = Date.now()
   // Tool calls get their own dedicated text blocks, tracked by toolCallId.
   const toolCalls: Map<string, ToolCallState> = new Map()
-  // Plan gets its own block, replaced on each update (last-write-wins).
+  // Side state for tool_use synthesis (EMULATE_CC_TOOLS).
+  const emulate = isEmulateEnabled()
+  // toolCallId → {blockIndex of open tool_use block, last input JSON string}
+  const synthBlocks: Map<string, { blockIndex: number; lastJson: string; toolUseId: string; name: string }> = new Map()
+  // Plan: if client has TodoWrite, synthesize tool_use; else markdown block.
+  const useTodoWriteSynthesis = clientHasTodoWrite(anthropicRequest.tools)
   let planBlockIndex: number | null = null
   let planRendered = ''
+  let planToolUseId: string | null = null
+  let planToolUseBlockIndex: number | null = null
+  let lastPlanInputJson = ''
+  let hasPlanUpdate = false
   builder.sendMessageStart(res, messageId, anthropicRequest.model)
   const pingTimer = setInterval(() => {
     if (!isClientDisconnected) builder.sendPing(res)
@@ -247,6 +259,33 @@ const handleStreaming = async (
     }
   }
 
+  /**
+   * Emit (or refresh) a synthesized Anthropic tool_use block for an ACP
+   * tool_call. Only fires when EMULATE_CC_TOOLS is enabled. Names are
+   * `kiro_*` prefixed so CC won't try to execute them — input shape matches
+   * CC's canonical tool schemas for forward-compatibility.
+   */
+  const emitSynthForCall = async (call: ToolCallStartLike | ToolCallUpdateLike): Promise<void> => {
+    if (!emulate) return
+    const prev = synthBlocks.get(call.toolCallId)
+    const synth = synthesizeToolUse(call as ToolCallStartLike, prev?.toolUseId ?? `toolu_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`)
+    if (!synth) return
+    const json = JSON.stringify(synth.input)
+    if (prev && prev.lastJson === json) return
+    if (prev) {
+      // Anthropic tool_use input is immutable once block_stop fires. Close prior, open new.
+      await safeWrite(() => builder.sendContentBlockStop(res, prev.blockIndex))
+    }
+    const newToolUseId = prev?.toolUseId ?? synth.toolUseId
+    const blockIndex = builder.incrementBlockIndex()
+    await safeWrite(() => builder.sendToolUseStart(res, blockIndex, newToolUseId, synth.name))
+    if (json !== '{}') {
+      await safeWrite(() => builder.sendToolUseDelta(res, blockIndex, json))
+      outputCharCount += json.length
+    }
+    synthBlocks.set(call.toolCallId, { blockIndex, lastJson: json, toolUseId: newToolUseId, name: synth.name })
+  }
+
   const applyUpdate = async (update: SessionUpdate): Promise<void> => {
     if (update.sessionUpdate === 'agent_thought_chunk') {
       const thought = (update.content as { thought?: string }).thought ?? ''
@@ -281,7 +320,7 @@ const handleStreaming = async (
     }
     if (update.sessionUpdate === 'tool_call') {
       const call = update as unknown as ToolCallStartLike
-      // Close any open text/thinking block; tool call gets its own block.
+      // Close any open text/thinking block; tool call gets its own blocks.
       if (currentThinkingBlockIndex !== null) {
         await safeWrite(() => builder.sendSignatureDelta(res, currentThinkingBlockIndex!, ''))
         await safeWrite(() => builder.sendContentBlockStop(res, currentThinkingBlockIndex!))
@@ -291,7 +330,7 @@ const handleStreaming = async (
         await safeWrite(() => builder.sendContentBlockStop(res, currentTextBlockIndex!))
         currentTextBlockIndex = null
       }
-      const rendered = renderToolCallStart(call)
+      const rendered = renderToolCallStart(call, cwd)
       const blockIndex = builder.incrementBlockIndex()
       await safeWrite(() => builder.sendContentBlockStart(res, blockIndex, { type: 'text', text: '' }))
       await safeWrite(() => builder.sendTextDelta(res, blockIndex, rendered))
@@ -302,6 +341,7 @@ const handleStreaming = async (
         rendered,
         status: call.status ?? 'pending',
       })
+      await emitSynthForCall(call)
       return
     }
     if (update.sessionUpdate === 'tool_call_update') {
@@ -313,7 +353,7 @@ const handleStreaming = async (
           await safeWrite(() => builder.sendContentBlockStop(res, currentTextBlockIndex!))
           currentTextBlockIndex = null
         }
-        const rendered = renderToolCallStart(upd)
+        const rendered = renderToolCallStart(upd, cwd)
         const blockIndex = builder.incrementBlockIndex()
         await safeWrite(() => builder.sendContentBlockStart(res, blockIndex, { type: 'text', text: '' }))
         await safeWrite(() => builder.sendTextDelta(res, blockIndex, rendered))
@@ -324,21 +364,24 @@ const handleStreaming = async (
           rendered,
           status: upd.status ?? 'pending',
         })
+        await emitSynthForCall(upd)
         return
       }
-      const { delta, rendered, status } = renderToolCallUpdate(prev, upd)
+      const { delta, rendered, status } = renderToolCallUpdate(prev, upd, cwd)
       if (delta.length > 0) {
         await safeWrite(() => builder.sendTextDelta(res, prev.blockIndex!, delta))
         outputCharCount += delta.length
       }
       prev.rendered = rendered
       prev.status = status
+      await emitSynthForCall(upd)
       return
     }
     if (update.sessionUpdate === 'plan') {
-      const entries = (update as unknown as { entries: Array<{ content: string; status: string; priority?: string }> }).entries
-      const planText = renderPlan(entries ?? [])
-      if (planText.length === 0) return
+      const entries = (update as unknown as { entries: Array<{ content: string; status: string; priority?: string }> }).entries ?? []
+      if (entries.length === 0) return
+      hasPlanUpdate = true
+      // Close any open text/thinking block; plan gets its own.
       if (currentThinkingBlockIndex !== null) {
         await safeWrite(() => builder.sendSignatureDelta(res, currentThinkingBlockIndex!, ''))
         await safeWrite(() => builder.sendContentBlockStop(res, currentThinkingBlockIndex!))
@@ -348,6 +391,36 @@ const handleStreaming = async (
         await safeWrite(() => builder.sendContentBlockStop(res, currentTextBlockIndex!))
         currentTextBlockIndex = null
       }
+
+      if (useTodoWriteSynthesis) {
+        // Emit a real Anthropic tool_use block so CC renders the TodoWrite widget.
+        const input = planToTodos(entries)
+        const fullJson = JSON.stringify(input)
+        if (planToolUseBlockIndex === null) {
+          planToolUseId = `toolu_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`
+          planToolUseBlockIndex = builder.incrementBlockIndex()
+          await safeWrite(() => builder.sendToolUseStart(res, planToolUseBlockIndex!, planToolUseId!, 'TodoWrite'))
+          await safeWrite(() => builder.sendToolUseDelta(res, planToolUseBlockIndex!, fullJson))
+          lastPlanInputJson = fullJson
+          outputCharCount += fullJson.length
+          return
+        }
+        // Subsequent plan update: stop previous block, open a new tool_use
+        // (tool_use input is immutable once stop is sent — Anthropic spec).
+        if (fullJson === lastPlanInputJson) return
+        await safeWrite(() => builder.sendContentBlockStop(res, planToolUseBlockIndex!))
+        planToolUseId = `toolu_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`
+        planToolUseBlockIndex = builder.incrementBlockIndex()
+        await safeWrite(() => builder.sendToolUseStart(res, planToolUseBlockIndex!, planToolUseId!, 'TodoWrite'))
+        await safeWrite(() => builder.sendToolUseDelta(res, planToolUseBlockIndex!, fullJson))
+        lastPlanInputJson = fullJson
+        outputCharCount += fullJson.length
+        return
+      }
+
+      // Fallback: markdown checklist in a text block.
+      const planText = renderPlan(entries)
+      if (planText.length === 0) return
       if (planBlockIndex === null) {
         planBlockIndex = builder.incrementBlockIndex()
         await safeWrite(() => builder.sendContentBlockStart(res, planBlockIndex!, { type: 'text', text: '' }))
@@ -356,7 +429,6 @@ const handleStreaming = async (
         outputCharCount += planText.length
         return
       }
-      // Plan updates replace the prior list. Append the *delta* — diff old vs new.
       if (planText.startsWith(planRendered)) {
         const delta = planText.slice(planRendered.length)
         if (delta.length > 0) {
@@ -364,7 +436,6 @@ const handleStreaming = async (
           outputCharCount += delta.length
         }
       } else {
-        // Full replacement — emit separator + fresh render.
         const sep = '\n---\n'
         await safeWrite(() => builder.sendTextDelta(res, planBlockIndex!, sep + planText))
         outputCharCount += sep.length + planText.length
@@ -412,7 +483,29 @@ const handleStreaming = async (
       if (currentTextBlockIndex !== null) {
         await safeWrite(() => builder.sendContentBlockStop(res, currentTextBlockIndex!))
       }
-      const hasContent = currentTextBlockIndex !== null || currentThinkingBlockIndex !== null
+      if (planBlockIndex !== null) {
+        await safeWrite(() => builder.sendContentBlockStop(res, planBlockIndex!))
+      }
+      if (planToolUseBlockIndex !== null) {
+        await safeWrite(() => builder.sendContentBlockStop(res, planToolUseBlockIndex!))
+      }
+      // Close any still-open synthesized tool_use blocks.
+      for (const synth of synthBlocks.values()) {
+        await safeWrite(() => builder.sendContentBlockStop(res, synth.blockIndex))
+      }
+      // Append deterministic "What changed" recap when there was tool activity.
+      if (toolCalls.size > 0 || hasPlanUpdate) {
+        const recap = buildRecap(toolCalls, hasPlanUpdate, { baseDir: cwd })
+        if (recap.length > 0) {
+          const recapIndex = builder.incrementBlockIndex()
+          await safeWrite(() => builder.sendContentBlockStart(res, recapIndex, { type: 'text', text: '' }))
+          await safeWrite(() => builder.sendTextDelta(res, recapIndex, recap))
+          await safeWrite(() => builder.sendContentBlockStop(res, recapIndex))
+          outputCharCount += recap.length
+        }
+      }
+      const hasContent = currentTextBlockIndex !== null || currentThinkingBlockIndex !== null ||
+        planBlockIndex !== null || planToolUseBlockIndex !== null || toolCalls.size > 0
       if (!hasContent) {
         const emptyIndex = builder.incrementBlockIndex()
         await safeWrite(() => builder.sendContentBlockStart(res, emptyIndex, { type: 'text', text: '' }))

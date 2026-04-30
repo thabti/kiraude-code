@@ -2,6 +2,9 @@ import crypto from 'node:crypto'
 import type { ContentBlock, SessionUpdate, PromptResponse } from '@agentclientprotocol/sdk'
 import { buildPersonaPrefix } from './persona.js'
 import { renderToolCallStart, renderToolCallUpdate, renderPlan, type ToolCallState, type ToolCallStartLike, type ToolCallUpdateLike } from './tool-renderer.js'
+import { buildRecap } from './recap.js'
+import { synthesizeToolUse, isEmulateEnabled } from './tool-synth.js'
+import crypto2 from 'node:crypto'
 
 interface AnthropicMessage {
   readonly role: string
@@ -304,8 +307,9 @@ const toAnthropicMessage = (
   updates: ReadonlyArray<CollectedUpdate>,
   promptResponse: PromptResponse,
   request: AnthropicRequest,
-  options?: { inputTokens?: number; cacheHit?: CacheHitInfo | null },
+  options?: { inputTokens?: number; cacheHit?: CacheHitInfo | null; baseDir?: string },
 ): AnthropicResponse => {
+  const baseDir = options?.baseDir ?? process.cwd()
   const content: AnthropicResponseBlock[] = []
   const inputTokens = options?.inputTokens ?? estimateInputTokensFromRequest(request)
   const cacheReadTokens = options?.cacheHit?.prefixTokens ?? 0
@@ -313,7 +317,24 @@ const toAnthropicMessage = (
   let outputText = ''
   let thinkingText = ''
   const toolCalls: Map<string, ToolCallState> = new Map()
+  // Latest merged call data per toolCallId (for synthesis).
+  const toolCallSnapshots: Map<string, ToolCallStartLike> = new Map()
   let lastPlanRendered = ''
+
+  const mergeCall = (id: string, upd: ToolCallStartLike | ToolCallUpdateLike): ToolCallStartLike => {
+    const prev = toolCallSnapshots.get(id)
+    const merged: ToolCallStartLike = {
+      toolCallId: id,
+      title: upd.title ?? prev?.title ?? null,
+      kind: upd.kind ?? prev?.kind ?? null,
+      content: upd.content ?? prev?.content ?? null,
+      locations: upd.locations ?? prev?.locations ?? null,
+      rawInput: upd.rawInput !== undefined ? upd.rawInput : prev?.rawInput,
+      status: upd.status ?? prev?.status ?? null,
+    }
+    toolCallSnapshots.set(id, merged)
+    return merged
+  }
 
   for (const { update } of updates) {
     if (update.sessionUpdate === 'agent_message_chunk') {
@@ -325,7 +346,8 @@ const toAnthropicMessage = (
     }
     if (update.sessionUpdate === 'tool_call') {
       const call = update as unknown as ToolCallStartLike
-      const rendered = renderToolCallStart(call)
+      mergeCall(call.toolCallId, call)
+      const rendered = renderToolCallStart(call, baseDir)
       toolCalls.set(call.toolCallId, {
         toolCallId: call.toolCallId,
         blockIndex: null,
@@ -335,13 +357,14 @@ const toAnthropicMessage = (
     }
     if (update.sessionUpdate === 'tool_call_update') {
       const upd = update as unknown as ToolCallUpdateLike
+      mergeCall(upd.toolCallId, upd)
       const prev = toolCalls.get(upd.toolCallId)
       if (prev) {
-        const { rendered, status } = renderToolCallUpdate(prev, upd)
+        const { rendered, status } = renderToolCallUpdate(prev, upd, baseDir)
         prev.rendered = rendered
         prev.status = status
       } else {
-        const rendered = renderToolCallStart(upd)
+        const rendered = renderToolCallStart(upd, baseDir)
         toolCalls.set(upd.toolCallId, {
           toolCallId: upd.toolCallId,
           blockIndex: null,
@@ -360,9 +383,27 @@ const toAnthropicMessage = (
     content.push({ type: 'thinking', thinking: thinkingText })
   }
   const toolText = Array.from(toolCalls.values()).map((s) => s.rendered).join('\n')
-  const combinedText = [outputText, toolText, lastPlanRendered].filter((s) => s.length > 0).join('\n\n')
+  const recap = buildRecap(toolCalls, lastPlanRendered.length > 0, { baseDir })
+  const combinedText = [outputText, toolText, lastPlanRendered, recap]
+    .filter((s) => s.length > 0)
+    .join('\n\n')
   if (combinedText.length > 0) {
     content.push({ type: 'text', text: combinedText })
+  }
+  // Synthesize tool_use blocks per call (EMULATE_CC_TOOLS, default on).
+  if (isEmulateEnabled()) {
+    for (const [id, snapshot] of toolCallSnapshots) {
+      const toolUseId = `toolu_${crypto2.randomUUID().replace(/-/g, '').slice(0, 24)}`
+      const synth = synthesizeToolUse(snapshot, toolUseId)
+      if (!synth) continue
+      content.push({
+        type: 'tool_use',
+        id: synth.toolUseId,
+        name: synth.name,
+        input: synth.input,
+      })
+      void id
+    }
   }
 
   const stopReason = mapStopReason(promptResponse.stopReason, false)

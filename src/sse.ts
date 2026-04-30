@@ -55,6 +55,19 @@ class StreamingResponseBuilder {
     })
   }
 
+  /**
+   * Open a tool_use content block. Anthropic spec: content_block_start with
+   * empty input ({}), then content_block_delta input_json_delta events stream
+   * the JSON, terminated by content_block_stop.
+   */
+  sendToolUseStart(res: Response, index: number, toolUseId: string, name: string): void {
+    sendSseEvent(res, 'content_block_start', {
+      type: 'content_block_start',
+      index,
+      content_block: { type: 'tool_use', id: toolUseId, name, input: {} },
+    })
+  }
+
   sendTextDelta(res: Response, index: number, text: string): void {
     sendSseEvent(res, 'content_block_delta', {
       type: 'content_block_delta',

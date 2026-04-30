@@ -1,3 +1,4 @@
+import * as path from 'node:path'
 import type { SessionUpdate } from '@agentclientprotocol/sdk'
 
 interface Diff {
@@ -113,12 +114,21 @@ const renderContentBlocks = (
   return parts.join('\n')
 }
 
-const formatHeader = (call: ToolCallStartLike): string => {
+/** Make an absolute path project-relative when possible. */
+const relPath = (p: string, baseDir: string): string => {
+  if (!path.isAbsolute(p)) return p
+  const rel = path.relative(baseDir, p)
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return p
+  return rel || '.'
+}
+
+const formatHeader = (call: ToolCallStartLike, baseDir: string = process.cwd()): string => {
   const icon = ICONS[call.kind ?? 'other'] ?? '⏺'
   const title = call.title ?? '(tool)'
   if (call.locations && call.locations.length > 0) {
     const loc = call.locations[0]!
-    const where = loc.line != null ? `${loc.path}:${loc.line}` : loc.path
+    const cleanPath = relPath(loc.path, baseDir)
+    const where = loc.line != null ? `${cleanPath}:${loc.line}` : cleanPath
     return `${icon} ${title} — ${where}`
   }
   return `${icon} ${title}`
@@ -146,10 +156,13 @@ interface ToolCallState {
 /**
  * Render a tool_call (start) update. Returns the full text payload for the
  * tool call's own SSE block. Caller should open a new content_block_start.
+ *
+ * baseDir defaults to process.cwd() — callers should pass the per-session cwd
+ * when known, so paths render relative to the user's project root.
  */
-const renderToolCallStart = (call: ToolCallStartLike): string => {
+const renderToolCallStart = (call: ToolCallStartLike, baseDir: string = process.cwd()): string => {
   const parts: string[] = []
-  parts.push('\n' + formatHeader(call))
+  parts.push('\n' + formatHeader(call, baseDir))
   const rawIn = formatRawInput(call.rawInput)
   if (rawIn) parts.push(`> ${rawIn}`)
   const body = renderContentBlocks(call.content, call.kind)
@@ -175,6 +188,7 @@ const computeDelta = (oldRendered: string, newRendered: string): string => {
 const renderToolCallUpdate = (
   prev: ToolCallState,
   update: ToolCallUpdateLike,
+  baseDir: string = process.cwd(),
 ): { delta: string; rendered: string; status: string } => {
   const merged: ToolCallStartLike = {
     toolCallId: update.toolCallId,
@@ -185,7 +199,7 @@ const renderToolCallUpdate = (
     rawInput: update.rawInput,
     status: update.status ?? prev.status,
   }
-  const newRendered = renderToolCallStart(merged)
+  const newRendered = renderToolCallStart(merged, baseDir)
   const delta = computeDelta(prev.rendered, newRendered)
   const status = update.status ?? prev.status
   let rendered = prev.rendered + delta

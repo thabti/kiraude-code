@@ -1,9 +1,5 @@
 # kiraude
 
-[![npm version](https://img.shields.io/npm/v/kiraude.svg)](https://www.npmjs.com/package/kiraude)
-[![license](https://img.shields.io/npm/l/kiraude.svg)](https://github.com/sabeur/kiraude/blob/main/LICENSE)
-[![node](https://img.shields.io/node/v/kiraude.svg)](https://nodejs.org)
-
 Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) powered by [Kiro CLI](https://kiro.dev). One command, zero config.
 
 ```bash
@@ -37,19 +33,26 @@ The proxy translates Anthropic API requests into ACP calls to `kiro-cli acp` sub
 
 ```
 src/
-├── index.ts              # Express server, CORS, health check, lifecycle
-├── acp-worker.ts         # Single kiro-cli subprocess + ACP connection
-├── pool.ts               # Worker pool (acquire/release, dead worker replacement)
-├── session-manager.ts    # Session affinity via x-claude-code-session-id
-├── translator.ts         # Anthropic ↔ ACP format translation
-├── kiro-models.ts        # Model alias resolution (claude-sonnet-4-6 → claude-sonnet-4.6)
-├── sse.ts                # SSE event helpers (message_start, content_block_delta, etc.)
-├── bin/kiraude.ts         # CLI: starts proxy, launches claude
+├── index.ts                        # Express server, CORS, health check, lifecycle
+├── acp-worker.ts                   # Single kiro-cli subprocess + ACP connection
+├── pool.ts                         # Worker pool (acquire/release, dead worker replacement)
+├── session-manager.ts              # Session affinity via x-claude-code-session-id
+├── translator.ts                   # Anthropic ↔ ACP format translation
+├── kiro-models.ts                  # Model alias resolution (claude-sonnet-4-6 → claude-sonnet-4.6)
+├── sse.ts                          # SSE event helpers (message_start, content_block_delta, etc.)
+├── banner.ts                       # ASCII banner on startup
+├── persona.ts                      # Builds persona/instructions prefix for new ACP sessions
+├── prompt-cache.ts                 # PromptCacheRegistry — prefix hash → ACP session ID
+├── tool-renderer.ts                # Renders ACP tool_call/plan updates into markdown for SSE
+├── logger.ts                       # Pino logger setup
+├── bin/kiraude.ts                  # CLI: starts proxy, launches claude
 ├── middleware/
-│   └── request-logger.ts # Request/response body logging
+│   ├── request-logger.ts           # Request/response body logging
+│   └── rate-limit-headers.ts       # Injects Anthropic rate-limit headers (no cooldowns)
 └── routes/
-    ├── messages.ts        # POST /v1/messages (streaming + non-streaming)
-    └── models.ts          # GET /v1/models, token counting
+    ├── messages.ts                 # POST /v1/messages (streaming + non-streaming)
+    ├── models.ts                   # GET /v1/models, token counting
+    └── bootstrap.ts                # GET /api/claude_cli/bootstrap (model picker)
 ```
 
 ## Prerequisites
@@ -110,7 +113,7 @@ The API key value is ignored; the server does not validate it.
 | Environment variable | Default    | Description                           |
 |----------------------|------------|---------------------------------------|
 | `PORT`               | `3456`     | HTTP server listen port               |
-| `POOL_SIZE`          | `2`        | Number of concurrent kiro-cli workers |
+| `POOL_SIZE`          | `5`        | Number of concurrent kiro-cli workers |
 | `KIRO_CLI_PATH`      | `kiro-cli` | Path to kiro-cli binary               |
 | `TRUST_ALL_TOOLS`    | `true`     | Pass `--trust-all-tools` to kiro-cli. Set to `false` to disable. |
 | `TRUST_TOOLS`        |            | Comma-separated tool names for `--trust-tools`. Overrides `TRUST_ALL_TOOLS`. |
@@ -277,3 +280,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 ## License
 
 MIT
+
+Copyright © 2025 Sabeur Thabti

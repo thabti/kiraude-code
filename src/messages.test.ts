@@ -243,3 +243,238 @@ describe('POST /v1/messages error handling', () => {
     expect((actual.body as { error: { type: string } }).error.type).toBe('api_error')
   })
 })
+
+const createCustomUpdateWorker = (updates: SessionUpdate[]): AcpWorker => {
+  return {
+    id: 0,
+    isReady: () => true,
+    isDead: () => false,
+    hasCapacity: () => true,
+    getSessionCwd: () => '/tmp',
+    getOrCreateSessionForCwd: vi.fn(async () => 'acp-sess-0'),
+    prompt: vi.fn(async (
+      _acpSessionId: string,
+      _content: ContentBlock[],
+      onUpdate?: (update: SessionUpdate) => void,
+    ) => {
+      if (onUpdate) {
+        for (const u of updates) onUpdate(u)
+      }
+      return { stopReason: 'end_turn' }
+    }),
+    cancel: vi.fn(),
+  } as unknown as AcpWorker
+}
+
+const fetchSseRaw = (app: express.Express, body: unknown): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const server: Server = app.listen(0, () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address ? address.port : 0
+      fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+        .then(async (res) => {
+          const text = await res.text()
+          server.close()
+          resolve(text)
+        })
+        .catch((err) => { server.close(); reject(err) })
+    })
+  })
+}
+
+describe('TodoWrite tool_use synthesis', () => {
+  it('emits a TodoWrite tool_use block when client has TodoWrite and kiro emits a plan', async () => {
+    const worker = createCustomUpdateWorker([
+      {
+        sessionUpdate: 'plan',
+        entries: [
+          { content: 'Fix bug', status: 'in_progress' },
+          { content: 'Run tests', status: 'pending' },
+        ],
+      } as unknown as SessionUpdate,
+    ])
+    const pool = createMockPool(worker)
+    const app = createTestApp(pool)
+    const text = await fetchSseRaw(app, {
+      model: 'kiro',
+      messages: [{ role: 'user', content: 'go' }],
+      max_tokens: 1024,
+      stream: true,
+      tools: [{ name: 'TodoWrite', description: 'Manage todos' }],
+    })
+    expect(text).toContain('"type":"tool_use"')
+    expect(text).toContain('"name":"TodoWrite"')
+    // SSE payload escapes inner JSON, so look for escaped fragments.
+    expect(text).toContain('todos')
+    expect(text).toContain('Fix bug')
+    expect(text).toContain('Fixing bug')
+    expect(text).toContain('in_progress')
+  })
+
+  it('falls back to markdown checklist when client lacks TodoWrite', async () => {
+    const worker = createCustomUpdateWorker([
+      {
+        sessionUpdate: 'plan',
+        entries: [{ content: 'Fix bug', status: 'pending' }],
+      } as unknown as SessionUpdate,
+    ])
+    const pool = createMockPool(worker)
+    const app = createTestApp(pool)
+    const text = await fetchSseRaw(app, {
+      model: 'kiro',
+      messages: [{ role: 'user', content: 'go' }],
+      max_tokens: 1024,
+      stream: true,
+      // no TodoWrite tool
+    })
+    expect(text).not.toContain('"name":"TodoWrite"')
+    expect(text).toContain('📋')
+    expect(text).toContain('Fix bug')
+  })
+})
+
+describe('EMULATE_CC_TOOLS — kiro_* tool_use synthesis', () => {
+  const restoreEnv = (prev: string | undefined): void => {
+    if (prev === undefined) delete process.env['EMULATE_CC_TOOLS']
+    else process.env['EMULATE_CC_TOOLS'] = prev
+  }
+
+  it('emits kiro_Edit tool_use SSE block for an edit tool_call (default on)', async () => {
+    const prev = process.env['EMULATE_CC_TOOLS']
+    delete process.env['EMULATE_CC_TOOLS']
+    try {
+      const worker = createCustomUpdateWorker([
+        {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc1',
+          title: 'Edit src/foo.ts',
+          kind: 'edit',
+          status: 'in_progress',
+          content: [{ type: 'diff', path: 'src/foo.ts', oldText: 'a', newText: 'b' }],
+        } as unknown as SessionUpdate,
+      ])
+      const pool = createMockPool(worker)
+      const app = createTestApp(pool)
+      const text = await fetchSseRaw(app, {
+        model: 'kiro',
+        messages: [{ role: 'user', content: 'go' }],
+        max_tokens: 1024,
+        stream: true,
+      })
+      expect(text).toContain('"type":"tool_use"')
+      expect(text).toContain('"name":"kiro_Edit"')
+      expect(text).toContain('file_path')
+      expect(text).toContain('src/foo.ts')
+      // text rendering still present for backwards compat
+      expect(text).toContain('✏️')
+    } finally {
+      restoreEnv(prev)
+    }
+  })
+
+  it('omits tool_use synthesis when EMULATE_CC_TOOLS=false', async () => {
+    const prev = process.env['EMULATE_CC_TOOLS']
+    process.env['EMULATE_CC_TOOLS'] = 'false'
+    try {
+      const worker = createCustomUpdateWorker([
+        {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc1',
+          title: 'Edit foo',
+          kind: 'edit',
+          content: [{ type: 'diff', path: 'foo.ts', oldText: 'a', newText: 'b' }],
+        } as unknown as SessionUpdate,
+      ])
+      const pool = createMockPool(worker)
+      const app = createTestApp(pool)
+      const text = await fetchSseRaw(app, {
+        model: 'kiro',
+        messages: [{ role: 'user', content: 'go' }],
+        max_tokens: 1024,
+        stream: true,
+      })
+      // No tool_use blocks except possibly TodoWrite (none here).
+      expect(text).not.toContain('"name":"kiro_Edit"')
+      // text rendering still happens
+      expect(text).toContain('✏️')
+    } finally {
+      restoreEnv(prev)
+    }
+  })
+
+  it('uses kiro_Bash for execute kind with command', async () => {
+    const prev = process.env['EMULATE_CC_TOOLS']
+    delete process.env['EMULATE_CC_TOOLS']
+    try {
+      const worker = createCustomUpdateWorker([
+        {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tc1',
+          title: 'Run npm test',
+          kind: 'execute',
+          rawInput: { command: 'npm test' },
+        } as unknown as SessionUpdate,
+      ])
+      const pool = createMockPool(worker)
+      const app = createTestApp(pool)
+      const text = await fetchSseRaw(app, {
+        model: 'kiro',
+        messages: [{ role: 'user', content: 'go' }],
+        max_tokens: 1024,
+        stream: true,
+      })
+      expect(text).toContain('"name":"kiro_Bash"')
+      expect(text).toContain('npm test')
+    } finally {
+      restoreEnv(prev)
+    }
+  })
+})
+
+describe('end-of-turn recap', () => {
+  it('appends a "What changed" block when tool calls happened', async () => {
+    const worker = createCustomUpdateWorker([
+      {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc1',
+        title: 'Edit src/foo.ts',
+        kind: 'edit',
+        status: 'completed',
+        locations: [{ path: 'src/foo.ts' }],
+      } as unknown as SessionUpdate,
+    ])
+    const pool = createMockPool(worker)
+    const app = createTestApp(pool)
+    const text = await fetchSseRaw(app, {
+      model: 'kiro',
+      messages: [{ role: 'user', content: 'go' }],
+      max_tokens: 1024,
+      stream: true,
+    })
+    expect(text).toContain('What changed')
+    expect(text).toContain('✅')
+    expect(text).toContain('Edit src/foo.ts')
+  })
+
+  it('omits recap when no tools and no plan', async () => {
+    const worker = createCustomUpdateWorker([
+      {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'just chatting' },
+      } as unknown as SessionUpdate,
+    ])
+    const pool = createMockPool(worker)
+    const app = createTestApp(pool)
+    const text = await fetchSseRaw(app, {
+      model: 'kiro',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1024,
+      stream: true,
+    })
+    expect(text).not.toContain('What changed')
+  })
+})

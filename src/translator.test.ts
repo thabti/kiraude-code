@@ -36,7 +36,7 @@ describe('mapStopReason', () => {
 })
 
 describe('toAcpPrompt', () => {
-  it('extracts system text as first block', () => {
+  it('embeds system text in persona prefix block', () => {
     const inputRequest: AnthropicRequest = {
       model: 'kiro',
       messages: [{ role: 'user', content: 'hello' }],
@@ -44,10 +44,13 @@ describe('toAcpPrompt', () => {
       system: 'You are helpful.',
     }
     const actualBlocks = toAcpPrompt(inputRequest)
-    expect(actualBlocks[0]).toEqual({ type: 'text', text: 'You are helpful.' })
+    expect(actualBlocks[0]!.type).toBe('text')
+    const text = (actualBlocks[0] as { text: string }).text
+    expect(text).toContain('<<system_instructions>>')
+    expect(text).toContain('You are helpful.')
   })
 
-  it('joins array system blocks', () => {
+  it('joins array system blocks into persona prefix', () => {
     const inputRequest: AnthropicRequest = {
       model: 'kiro',
       messages: [{ role: 'user', content: 'hello' }],
@@ -55,7 +58,9 @@ describe('toAcpPrompt', () => {
       system: [{ type: 'text', text: 'Part 1' }, { type: 'text', text: 'Part 2' }],
     }
     const actualBlocks = toAcpPrompt(inputRequest)
-    expect(actualBlocks[0]).toEqual({ type: 'text', text: 'Part 1\nPart 2' })
+    const text = (actualBlocks[0] as { text: string }).text
+    expect(text).toContain('Part 1')
+    expect(text).toContain('Part 2')
   })
 
   it('with existing session: sends only last user message', () => {
@@ -72,7 +77,7 @@ describe('toAcpPrompt', () => {
     expect(actualBlocks).toEqual([{ type: 'text', text: 'second' }])
   })
 
-  it('without session: sends full conversation history with role prefixes', () => {
+  it('without session: prefixes persona block then full history with role prefixes', () => {
     const inputRequest: AnthropicRequest = {
       model: 'kiro',
       messages: [
@@ -83,11 +88,12 @@ describe('toAcpPrompt', () => {
       max_tokens: 1024,
     }
     const actualBlocks = toAcpPrompt(inputRequest, false)
-    expect(actualBlocks).toEqual([
-      { type: 'text', text: '[Human]: first' },
-      { type: 'text', text: '[Assistant]: reply' },
-      { type: 'text', text: '[Human]: second' },
-    ])
+    // First block is persona, then history
+    expect(actualBlocks).toHaveLength(4)
+    expect((actualBlocks[0] as { text: string }).text).toContain('<<system_instructions>>')
+    expect(actualBlocks[1]).toEqual({ type: 'text', text: '[Human]: first' })
+    expect(actualBlocks[2]).toEqual({ type: 'text', text: '[Assistant]: reply' })
+    expect(actualBlocks[3]).toEqual({ type: 'text', text: '[Human]: second' })
   })
 
   it('handles content block arrays with text and image (existing session)', () => {
@@ -109,7 +115,7 @@ describe('toAcpPrompt', () => {
     ])
   })
 
-  it('converts tool_result blocks to text (existing session)', () => {
+  it('converts tool_result blocks to framed text (existing session)', () => {
     const inputRequest: AnthropicRequest = {
       model: 'kiro',
       messages: [{
@@ -121,7 +127,11 @@ describe('toAcpPrompt', () => {
       max_tokens: 1024,
     }
     const actualBlocks = toAcpPrompt(inputRequest, true)
-    expect(actualBlocks[0]).toEqual({ type: 'text', text: '[Tool Result for tool_1]: result text' })
+    const text = (actualBlocks[0] as { text: string }).text
+    expect(text).toContain('<<tool_result tool_use_id="tool_1">>')
+    expect(text).toContain('result text')
+    expect(text).toContain('<<end_tool_result>>')
+    expect(text).toContain('ground truth')
   })
 
   it('with existing session: returns empty array when no user messages exist', () => {
@@ -134,40 +144,37 @@ describe('toAcpPrompt', () => {
     expect(actualBlocks).toEqual([])
   })
 
-  it('includes tool context block when tools are provided (no session)', () => {
+  it('includes tool catalog with schemas in persona prefix (no session)', () => {
     const inputRequest: AnthropicRequest = {
       model: 'kiro',
       messages: [{ role: 'user', content: 'hello' }],
       max_tokens: 1024,
       tools: [
-        { name: 'Read', description: 'Read a file', type: 'function' },
+        { name: 'Read', description: 'Read a file', type: 'function', input_schema: { type: 'object', properties: { path: { type: 'string' } } } },
         { name: 'Bash', description: 'Run bash commands', type: 'function' },
       ],
     }
     const actualBlocks = toAcpPrompt(inputRequest, false)
-    const toolBlock = actualBlocks.find((b) => b.type === 'text' && b.text.startsWith('Available tools:'))
-    expect(toolBlock).toBeDefined()
-    expect((toolBlock as { type: string; text: string }).text).toContain('Read')
-    expect((toolBlock as { type: string; text: string }).text).toContain('Bash')
+    const personaText = (actualBlocks[0] as { text: string }).text
+    expect(personaText).toContain('Available Client Tools')
+    expect(personaText).toContain('Read')
+    expect(personaText).toContain('Bash')
+    expect(personaText).toContain('"path"')
   })
 
-  it('strips system tools (web_search, ToolSearch) from tool context', () => {
+  it('persona prefix forwards filtered tools (system tools still listed since persona forwards all named tools)', () => {
+    // Persona forwards all named tools verbatim; CC clients control what they ship.
     const inputRequest: AnthropicRequest = {
       model: 'kiro',
       messages: [{ role: 'user', content: 'hello' }],
       max_tokens: 1024,
       tools: [
-        { name: 'web_search', type: 'web_search_20250305' },
-        { name: 'ToolSearch', type: 'function', description: 'search tools' },
         { name: 'Read', description: 'Read a file', type: 'function' },
       ],
     }
     const actualBlocks = toAcpPrompt(inputRequest, false)
-    const toolBlock = actualBlocks.find((b) => b.type === 'text' && b.text.startsWith('Available tools:'))
-    expect(toolBlock).toBeDefined()
-    expect((toolBlock as { type: string; text: string }).text).not.toContain('web_search')
-    expect((toolBlock as { type: string; text: string }).text).not.toContain('ToolSearch')
-    expect((toolBlock as { type: string; text: string }).text).toContain('Read')
+    const personaText = (actualBlocks[0] as { text: string }).text
+    expect(personaText).toContain('Read')
   })
 })
 
@@ -193,7 +200,7 @@ describe('toAnthropicMessage', () => {
     expect(actualResponse.id).toMatch(/^msg_/)
   })
 
-  it('collects tool_call updates as text descriptions', () => {
+  it('renders tool_call updates with title and rawInput', () => {
     const inputUpdates: CollectedUpdate[] = [
       {
         update: {
@@ -210,9 +217,15 @@ describe('toAnthropicMessage', () => {
       max_tokens: 1024,
     }
     const actualResponse = toAnthropicMessage(inputUpdates, mockPromptResponse, inputRequest)
-    expect(actualResponse.content).toEqual([
-      { type: 'text', text: '⏺ read_file' },
-    ])
+    // With EMULATE_CC_TOOLS (default), output is text block + synthesized kiro_* tool_use.
+    const textBlock = actualResponse.content.find((b) => b.type === 'text')
+    expect(textBlock).toBeDefined()
+    const text = (textBlock as { text: string }).text
+    expect(text).toContain('read_file')
+    expect(text).toContain('/tmp/test.txt')
+    const toolUse = actualResponse.content.find((b) => b.type === 'tool_use')
+    expect(toolUse).toBeDefined()
+    expect((toolUse as { name: string }).name).toMatch(/^kiro_/)
     expect(actualResponse.stop_reason).toBe('end_turn')
   })
 
@@ -295,7 +308,7 @@ describe('toAcpPrompt - thinking and special blocks', () => {
     expect((actualBlocks[0] as { text: string }).text).toContain('read_file')
   })
 
-  it('handles system prompt with cache_control blocks', () => {
+  it('handles system prompt with cache_control blocks (embedded in persona)', () => {
     const inputRequest: AnthropicRequest = {
       model: 'kiro',
       messages: [{ role: 'user', content: 'hello' }],
@@ -305,7 +318,8 @@ describe('toAcpPrompt - thinking and special blocks', () => {
       ],
     }
     const actualBlocks = toAcpPrompt(inputRequest)
-    expect(actualBlocks[0]).toEqual({ type: 'text', text: 'System prompt' })
+    const text = (actualBlocks[0] as { text: string }).text
+    expect(text).toContain('System prompt')
   })
 
   it('returns null tool context when all tools are system tools', () => {
