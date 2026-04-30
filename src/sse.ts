@@ -3,6 +3,8 @@ import type { Response } from 'express'
 interface SseUsage {
   readonly input_tokens: number
   readonly output_tokens: number
+  readonly cache_creation_input_tokens?: number
+  readonly cache_read_input_tokens?: number
 }
 
 interface ContentBlockStart {

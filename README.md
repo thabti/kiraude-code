@@ -206,6 +206,50 @@ POOL_SIZE=4 npx kiraude
 LOG_LEVEL=debug npm run dev
 ```
 
+## Running in the background
+
+Run the proxy without tying up a terminal.
+
+### Using nohup
+
+```bash
+nohup npm start > /dev/null 2>&1 &
+echo $!  # prints the PID
+```
+
+Kill it later:
+
+```bash
+kill $(lsof -ti:3456)
+```
+
+### Using a PID file
+
+```bash
+npm start &
+echo $! > .kiraude.pid
+
+# Stop it
+kill $(cat .kiraude.pid) && rm .kiraude.pid
+```
+
+### Using pm2
+
+```bash
+npm install -g pm2
+pm2 start dist/index.js --name kiraude
+pm2 stop kiraude    # pause
+pm2 restart kiraude # restart
+pm2 delete kiraude  # remove
+pm2 logs kiraude    # tail logs
+```
+
+### Quick health check
+
+```bash
+curl -s http://localhost:3456/health | jq .
+```
+
 ## Security
 
 This proxy is designed for **local development only**.

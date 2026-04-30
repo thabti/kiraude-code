@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { Readable, Writable } from 'node:stream'
 import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import * as os from 'node:os'
 import * as acp from '@agentclientprotocol/sdk'
 import type {
   SessionNotification,
@@ -25,7 +27,7 @@ import type {
   SessionUpdate,
 } from '@agentclientprotocol/sdk'
 
-type WorkerState = 'idle' | 'busy' | 'dead'
+type WorkerState = 'initializing' | 'ready' | 'dead'
 
 type SessionUpdateCallback = (update: SessionUpdate) => void
 
@@ -33,11 +35,23 @@ interface AcpWorkerOptions {
   readonly id: number
   readonly kiroCli: string
   readonly cwd: string
+  readonly maxConcurrentSessions?: number
+  readonly onDeath?: (worker: AcpWorker) => void
 }
 
-const MAX_TERMINAL_OUTPUT_BYTES = 512_000 // 512 KB default cap per terminal
+interface SessionSlot {
+  readonly acpSessionId: string
+  cwd: string
+  currentModelId: string | null
+  inFlight: boolean
+  onUpdate: SessionUpdateCallback | null
+  lastUsedAt: number
+}
 
-/** Build kiro-cli acp spawn args from environment configuration. */
+const MAX_TERMINAL_OUTPUT_BYTES = 512_000
+const TERMINAL_SPILL_THRESHOLD_BYTES = 256_000
+const SPILL_DIR = path.join(os.tmpdir(), 'kiraude-spill')
+
 const buildSpawnArgs = (): string[] => {
   const args = ['acp']
   const trustTools = process.env.TRUST_TOOLS?.trim()
@@ -52,43 +66,69 @@ const buildSpawnArgs = (): string[] => {
 class AcpWorker {
   readonly id: number
   private readonly kiroCli: string
-  private cwd: string
+  private readonly defaultCwd: string
+  private readonly maxConcurrentSessions: number
+  private readonly onDeath: ((worker: AcpWorker) => void) | undefined
   private process: ChildProcess | null = null
   private connection: acp.ClientSideConnection | null = null
-  private sessionId: string | null = null
-  private onUpdate: SessionUpdateCallback | null = null
-  private state: WorkerState = 'idle'
-  private currentModelId: string | null = null
+  private state: WorkerState = 'initializing'
+  private sessions: Map<string, SessionSlot> = new Map()
+  private sessionsByCwd: Map<string, string> = new Map()
   private terminals: Map<string, ChildProcess> = new Map()
-  private terminalOutputs: Map<string, string> = new Map()
+  private terminalOutputs: Map<string, Buffer[]> = new Map()
+  private terminalOutputBytes: Map<string, number> = new Map()
   private terminalExitStatuses: Map<string, { exitCode: number | null; signal: string | null }> = new Map()
   private terminalWaiters: Map<string, Array<(status: { exitCode: number | null; signal: string | null }) => void>> = new Map()
   private nextTerminalId = 0
+  private spawnedAt = 0
 
   constructor(options: AcpWorkerOptions) {
     this.id = options.id
     this.kiroCli = options.kiroCli
-    this.cwd = options.cwd
+    this.defaultCwd = options.cwd
+    this.maxConcurrentSessions = options.maxConcurrentSessions ?? 8
+    this.onDeath = options.onDeath
   }
 
   getState(): WorkerState {
     return this.state
   }
 
-  setState(state: WorkerState): void {
-    this.state = state
+  isReady(): boolean {
+    return this.state === 'ready'
   }
 
-  getSessionId(): string | null {
-    return this.sessionId
+  isDead(): boolean {
+    return this.state === 'dead'
+  }
+
+  getSessionCount(): number {
+    return this.sessions.size
+  }
+
+  getInFlightCount(): number {
+    let n = 0
+    for (const s of this.sessions.values()) {
+      if (s.inFlight) n++
+    }
+    return n
+  }
+
+  hasCapacity(): boolean {
+    return this.state === 'ready' && this.getInFlightCount() < this.maxConcurrentSessions
+  }
+
+  getUptimeMs(): number {
+    return Date.now() - this.spawnedAt
   }
 
   async init(): Promise<void> {
+    this.spawnedAt = Date.now()
     const args = buildSpawnArgs()
     console.log(`[worker-${this.id}] spawning: ${this.kiroCli} ${args.join(' ')}`)
     const child = spawn(this.kiroCli, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: this.cwd,
+      cwd: this.defaultCwd,
     })
     this.process = child
     child.stderr?.on('data', (chunk: Buffer) => {
@@ -96,9 +136,11 @@ class AcpWorker {
     })
     child.on('exit', (code, signal) => {
       console.error(`[worker-${this.id}] process exited (code=${code}, signal=${signal})`)
-      this.state = 'dead'
-      this.connection = null
-      this.sessionId = null
+      this.markDead()
+    })
+    child.on('error', (err) => {
+      console.error(`[worker-${this.id}] process error: ${err}`)
+      this.markDead()
     })
     const output = Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>
     const input = Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>
@@ -108,116 +150,177 @@ class AcpWorker {
     const initResult = await this.connection.initialize({
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
-        },
+        fs: { readTextFile: true, writeTextFile: true },
         terminal: true,
       },
     })
     console.log(`[worker-${this.id}] initialized (protocol v${initResult.protocolVersion})`)
-    const sessionResult = await this.connection.newSession({
-      cwd: this.cwd,
-      mcpServers: [],
-    })
-    this.sessionId = sessionResult.sessionId
-    console.log(`[worker-${this.id}] session created: ${this.sessionId}`)
+    this.state = 'ready'
   }
 
-  getCwd(): string {
-    return this.cwd
-  }
-
-  /** Create a new ACP session with a different working directory. */
-  async setCwd(newCwd: string): Promise<void> {
-    if (!this.connection) {
-      throw new Error(`Worker ${this.id} is not initialized`)
+  /**
+   * Create new ACP session with given cwd. Returns the proxy session key
+   * (acpSessionId). One worker holds many sessions concurrently.
+   */
+  async createSession(cwd: string): Promise<string> {
+    if (!this.connection) throw new Error(`Worker ${this.id} not initialized`)
+    if (this.state === 'dead') throw new Error(`Worker ${this.id} is dead`)
+    const result = await this.connection.newSession({ cwd, mcpServers: [] })
+    const slot: SessionSlot = {
+      acpSessionId: result.sessionId,
+      cwd,
+      currentModelId: null,
+      inFlight: false,
+      onUpdate: null,
+      lastUsedAt: Date.now(),
     }
-    if (newCwd === this.cwd) return
-    console.log(`[worker-${this.id}] switching cwd: ${this.cwd} → ${newCwd}`)
-    const sessionResult = await this.connection.newSession({
-      cwd: newCwd,
-      mcpServers: [],
-    })
-    this.cwd = newCwd
-    this.sessionId = sessionResult.sessionId
-    this.currentModelId = null
-    console.log(`[worker-${this.id}] new session for cwd: ${this.sessionId}`)
+    this.sessions.set(result.sessionId, slot)
+    this.sessionsByCwd.set(cwd, result.sessionId)
+    return result.sessionId
+  }
+
+  /** Find existing session matching cwd, or create one. */
+  async getOrCreateSessionForCwd(cwd: string): Promise<string> {
+    const existing = this.sessionsByCwd.get(cwd)
+    if (existing && this.sessions.has(existing)) return existing
+    return this.createSession(cwd)
+  }
+
+  getSessionCwd(acpSessionId: string): string | null {
+    return this.sessions.get(acpSessionId)?.cwd ?? null
+  }
+
+  removeSession(acpSessionId: string): void {
+    const slot = this.sessions.get(acpSessionId)
+    if (!slot) return
+    this.sessions.delete(acpSessionId)
+    if (this.sessionsByCwd.get(slot.cwd) === acpSessionId) {
+      this.sessionsByCwd.delete(slot.cwd)
+    }
   }
 
   async prompt(
+    acpSessionId: string,
     content: Array<ContentBlock>,
     onUpdate?: SessionUpdateCallback,
     modelId?: string,
   ): Promise<PromptResponse> {
-    if (!this.connection || !this.sessionId) {
-      throw new Error(`Worker ${this.id} is not initialized`)
-    }
-    if (this.state === 'dead') {
-      throw new Error(`Worker ${this.id} is dead`)
-    }
-    this.state = 'busy'
-    this.onUpdate = onUpdate ?? null
+    if (!this.connection) throw new Error(`Worker ${this.id} not initialized`)
+    if (this.state === 'dead') throw new Error(`Worker ${this.id} is dead`)
+    const slot = this.sessions.get(acpSessionId)
+    if (!slot) throw new Error(`Session ${acpSessionId} unknown to worker ${this.id}`)
+    if (slot.inFlight) throw new Error(`Session ${acpSessionId} already has prompt in flight`)
+    slot.inFlight = true
+    slot.onUpdate = onUpdate ?? null
+    slot.lastUsedAt = Date.now()
     try {
-      if (modelId && modelId !== this.currentModelId) {
+      if (modelId && modelId !== slot.currentModelId) {
         try {
-          await this.connection.unstable_setSessionModel({
-            sessionId: this.sessionId,
-            modelId,
-          })
-          this.currentModelId = modelId
-          console.log(`[worker-${this.id}] model set to: ${modelId}`)
+          await this.connection.unstable_setSessionModel({ sessionId: acpSessionId, modelId })
+          slot.currentModelId = modelId
         } catch (err) {
           console.warn(`[worker-${this.id}] setSessionModel failed: ${err}`)
         }
       }
-      const result = await this.connection.prompt({
-        sessionId: this.sessionId,
-        prompt: content,
-      })
+      const result = await this.connection.prompt({ sessionId: acpSessionId, prompt: content })
       return result
     } finally {
-      this.onUpdate = null
+      slot.onUpdate = null
+      slot.inFlight = false
+      slot.lastUsedAt = Date.now()
       this.cleanupCompletedTerminals()
-      if (this.state === 'busy') {
-        this.state = 'idle'
-      }
     }
   }
 
-  /** Remove terminal state for processes that have exited. */
+  async cancel(acpSessionId: string): Promise<void> {
+    if (!this.connection) return
+    if (!this.sessions.has(acpSessionId)) return
+    await this.connection.cancel({ sessionId: acpSessionId })
+  }
+
   private cleanupCompletedTerminals(): void {
     for (const [terminalId, status] of this.terminalExitStatuses) {
       if (status.exitCode !== null || status.signal !== null) {
         this.terminals.delete(terminalId)
         this.terminalOutputs.delete(terminalId)
+        this.terminalOutputBytes.delete(terminalId)
         this.terminalExitStatuses.delete(terminalId)
         this.terminalWaiters.delete(terminalId)
       }
     }
   }
 
-  async cancel(): Promise<void> {
-    if (!this.connection || !this.sessionId) return
-    await this.connection.cancel({ sessionId: this.sessionId })
+  private markDead(): void {
+    if (this.state === 'dead') return
+    this.state = 'dead'
+    this.connection = null
+    this.sessions.clear()
+    this.sessionsByCwd.clear()
+    if (this.onDeath) this.onDeath(this)
   }
 
   kill(): void {
     if (this.process) {
-      this.process.kill()
+      try { this.process.kill() } catch { /* ignore */ }
       this.process = null
     }
     this.state = 'dead'
     this.connection = null
-    this.sessionId = null
-    this.currentModelId = null
-    for (const [, proc] of this.terminals) {
-      proc.kill()
+    this.sessions.clear()
+    this.sessionsByCwd.clear()
+    for (const proc of this.terminals.values()) {
+      try { proc.kill() } catch { /* ignore */ }
     }
     this.terminals.clear()
     this.terminalOutputs.clear()
+    this.terminalOutputBytes.clear()
     this.terminalExitStatuses.clear()
     this.terminalWaiters.clear()
+  }
+
+  private routeUpdate(notification: SessionNotification): void {
+    const slot = this.sessions.get(notification.sessionId)
+    if (slot?.onUpdate) {
+      try {
+        slot.onUpdate(notification.update)
+      } catch (err) {
+        console.error(`[worker-${this.id}] onUpdate callback threw: ${err}`)
+      }
+    }
+  }
+
+  private appendTerminalOutput(terminalId: string, chunk: Buffer, byteLimit: number): void {
+    const chunks = this.terminalOutputs.get(terminalId)
+    if (!chunks) return
+    chunks.push(chunk)
+    const newSize = (this.terminalOutputBytes.get(terminalId) ?? 0) + chunk.byteLength
+    this.terminalOutputBytes.set(terminalId, newSize)
+    while ((this.terminalOutputBytes.get(terminalId) ?? 0) > byteLimit && chunks.length > 1) {
+      const dropped = chunks.shift()!
+      this.terminalOutputBytes.set(terminalId, (this.terminalOutputBytes.get(terminalId) ?? 0) - dropped.byteLength)
+    }
+  }
+
+  private async readTerminalOutput(terminalId: string): Promise<{ output: string; truncated: boolean }> {
+    const chunks = this.terminalOutputs.get(terminalId) ?? []
+    const totalBytes = this.terminalOutputBytes.get(terminalId) ?? 0
+    if (totalBytes <= TERMINAL_SPILL_THRESHOLD_BYTES) {
+      return { output: Buffer.concat(chunks).toString('utf8'), truncated: false }
+    }
+    try {
+      await fs.mkdir(SPILL_DIR, { recursive: true })
+      const spillPath = path.join(SPILL_DIR, `${terminalId}-${Date.now()}.txt`)
+      await fs.writeFile(spillPath, Buffer.concat(chunks))
+      const head = chunks[0]?.toString('utf8').slice(0, 4000) ?? ''
+      const last = chunks[chunks.length - 1]?.toString('utf8').slice(-4000) ?? ''
+      const preview =
+        `[output ${totalBytes} bytes — full content spilled to ${spillPath}]\n` +
+        `--- HEAD ---\n${head}\n--- TAIL ---\n${last}`
+      return { output: preview, truncated: true }
+    } catch (err) {
+      console.warn(`[worker-${this.id}] spill failed: ${err}`)
+      return { output: Buffer.concat(chunks).toString('utf8').slice(-MAX_TERMINAL_OUTPUT_BYTES), truncated: true }
+    }
   }
 
   private createClient(): acp.Client {
@@ -226,18 +329,12 @@ class AcpWorker {
         const allowOption = params.options.find((o) => o.kind === 'allow_once')
           ?? params.options.find((o) => o.kind === 'allow_always')
           ?? params.options[0]
-        console.log(`[worker-${this.id}] auto-approving permission: ${params.toolCall.title} → ${allowOption?.name}`)
         return Promise.resolve({
-          outcome: {
-            outcome: 'selected',
-            optionId: allowOption!.optionId,
-          },
+          outcome: { outcome: 'selected', optionId: allowOption!.optionId },
         })
       },
       sessionUpdate: (params: SessionNotification): Promise<void> => {
-        if (this.onUpdate) {
-          this.onUpdate(params.update)
-        }
+        this.routeUpdate(params)
         return Promise.resolve()
       },
       readTextFile: async (params: ReadTextFileRequest): Promise<ReadTextFileResponse> => {
@@ -256,51 +353,39 @@ class AcpWorker {
       },
       createTerminal: (params: CreateTerminalRequest): Promise<CreateTerminalResponse> => {
         const terminalId = `term-${this.id}-${this.nextTerminalId++}`
+        const slot = params.cwd ? null : this.sessions.values().next().value
+        const cwd = params.cwd ?? slot?.cwd ?? this.defaultCwd
         const child = spawn(params.command, params.args ?? [], {
-          cwd: params.cwd ?? this.cwd,
+          cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           env: params.env
             ? { ...process.env, ...Object.fromEntries(params.env.map((e) => [e.name, e.value])) }
             : process.env as NodeJS.ProcessEnv,
         })
         this.terminals.set(terminalId, child)
-        this.terminalOutputs.set(terminalId, '')
-        const appendOutput = (chunk: Buffer): void => {
-          const current = this.terminalOutputs.get(terminalId) ?? ''
-          const limit = params.outputByteLimit ?? MAX_TERMINAL_OUTPUT_BYTES
-          let updated = current + chunk.toString()
-          if (Buffer.byteLength(updated) > limit) {
-            updated = updated.slice(-limit)
-          }
-          this.terminalOutputs.set(terminalId, updated)
-        }
-        child.stdout?.on('data', appendOutput)
-        child.stderr?.on('data', appendOutput)
+        this.terminalOutputs.set(terminalId, [])
+        this.terminalOutputBytes.set(terminalId, 0)
+        const limit = params.outputByteLimit ?? MAX_TERMINAL_OUTPUT_BYTES
+        const append = (chunk: Buffer): void => this.appendTerminalOutput(terminalId, chunk, limit)
+        child.stdout?.on('data', append)
+        child.stderr?.on('data', append)
         child.on('exit', (exitCode, signal) => {
           const status = { exitCode: exitCode ?? null, signal: signal ?? null }
           this.terminalExitStatuses.set(terminalId, status)
           const waiters = this.terminalWaiters.get(terminalId) ?? []
-          for (const resolve of waiters) {
-            resolve(status)
-          }
+          for (const resolve of waiters) resolve(status)
           this.terminalWaiters.delete(terminalId)
         })
         return Promise.resolve({ terminalId })
       },
-      terminalOutput: (params: TerminalOutputRequest): Promise<TerminalOutputResponse> => {
-        const output = this.terminalOutputs.get(params.terminalId) ?? ''
+      terminalOutput: async (params: TerminalOutputRequest): Promise<TerminalOutputResponse> => {
         const exitStatus = this.terminalExitStatuses.get(params.terminalId) ?? null
-        return Promise.resolve({
-          output,
-          truncated: false,
-          exitStatus,
-        })
+        const { output, truncated } = await this.readTerminalOutput(params.terminalId)
+        return { output, truncated, exitStatus }
       },
       waitForTerminalExit: (params: WaitForTerminalExitRequest): Promise<WaitForTerminalExitResponse> => {
         const existing = this.terminalExitStatuses.get(params.terminalId)
-        if (existing) {
-          return Promise.resolve(existing)
-        }
+        if (existing) return Promise.resolve(existing)
         return new Promise((resolve) => {
           const waiters = this.terminalWaiters.get(params.terminalId) ?? []
           waiters.push(resolve)
@@ -310,33 +395,28 @@ class AcpWorker {
       killTerminal: (params: KillTerminalRequest): Promise<KillTerminalResponse> => {
         const child = this.terminals.get(params.terminalId)
         if (child) {
-          child.kill()
+          try { child.kill() } catch { /* ignore */ }
         }
         return Promise.resolve({})
       },
       releaseTerminal: (params: ReleaseTerminalRequest): Promise<ReleaseTerminalResponse> => {
         const child = this.terminals.get(params.terminalId)
         if (child) {
-          child.kill()
+          try { child.kill() } catch { /* ignore */ }
           this.terminals.delete(params.terminalId)
         }
         this.terminalOutputs.delete(params.terminalId)
+        this.terminalOutputBytes.delete(params.terminalId)
         this.terminalExitStatuses.delete(params.terminalId)
         this.terminalWaiters.delete(params.terminalId)
         return Promise.resolve({})
       },
-      // Silently absorb Kiro-specific extension notifications (_kiro.dev/*)
-      // so the ACP SDK does not emit "Method not found" errors for them.
-      extNotification: (_method: string, _params: Record<string, unknown>): Promise<void> => {
-        return Promise.resolve()
-      },
-      extMethod: (_method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> => {
-        return Promise.resolve({})
-      },
+      extNotification: (_method: string, _params: Record<string, unknown>): Promise<void> => Promise.resolve(),
+      extMethod: (_method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> => Promise.resolve({}),
     }
   }
 }
 
 export default AcpWorker
 export { buildSpawnArgs }
-export type { WorkerState, SessionUpdateCallback, AcpWorkerOptions }
+export type { WorkerState, SessionUpdateCallback, AcpWorkerOptions, SessionSlot }

@@ -193,7 +193,7 @@ describe('toAnthropicMessage', () => {
     expect(actualResponse.id).toMatch(/^msg_/)
   })
 
-  it('collects tool_call updates as tool_use blocks', () => {
+  it('collects tool_call updates as text descriptions', () => {
     const inputUpdates: CollectedUpdate[] = [
       {
         update: {
@@ -211,9 +211,9 @@ describe('toAnthropicMessage', () => {
     }
     const actualResponse = toAnthropicMessage(inputUpdates, mockPromptResponse, inputRequest)
     expect(actualResponse.content).toEqual([
-      { type: 'tool_use', id: 'tc_1', name: 'read_file', input: { path: '/tmp/test.txt' } },
+      { type: 'text', text: '⏺ read_file' },
     ])
-    expect(actualResponse.stop_reason).toBe('tool_use')
+    expect(actualResponse.stop_reason).toBe('end_turn')
   })
 
   it('estimates input and output tokens', () => {
@@ -342,7 +342,7 @@ describe('toAnthropicMessage - additional coverage', () => {
     expect(actualResponse.content[1]).toEqual({ type: 'text', text: 'answer' })
   })
 
-  it('handles tool_call_update by updating existing tool call input', () => {
+  it('handles tool_call_update by including tool title in text', () => {
     const inputUpdates: CollectedUpdate[] = [
       {
         update: {
@@ -367,9 +367,9 @@ describe('toAnthropicMessage - additional coverage', () => {
       max_tokens: 1024,
     }
     const actualResponse = toAnthropicMessage(inputUpdates, mockPromptResponse, inputRequest)
-    const toolBlock = actualResponse.content.find((b) => b.type === 'tool_use')
-    expect(toolBlock).toBeDefined()
-    expect((toolBlock as { input: unknown }).input).toEqual({ path: '/new' })
+    const textBlock = actualResponse.content.find((b) => b.type === 'text')
+    expect(textBlock).toBeDefined()
+    expect((textBlock as { text: string }).text).toContain('⏺ read_file')
   })
 
   it('returns empty content array when no updates', () => {

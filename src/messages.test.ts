@@ -6,12 +6,22 @@ import type AcpPool from './pool.js'
 import type AcpWorker from './acp-worker.js'
 import type { SessionUpdate, PromptResponse, ContentBlock } from '@agentclientprotocol/sdk'
 
-const createMockWorker = (promptResult?: PromptResponse, onPromptCalled?: (content: ContentBlock[]) => void): AcpWorker => {
+const createMockWorker = (
+  promptResult?: PromptResponse,
+  onPromptCalled?: (content: ContentBlock[]) => void,
+): AcpWorker => {
   return {
     id: 0,
-    getState: () => 'busy',
-    setState: vi.fn(),
-    prompt: vi.fn(async (content: ContentBlock[], onUpdate?: (update: SessionUpdate) => void) => {
+    isReady: () => true,
+    isDead: () => false,
+    hasCapacity: () => true,
+    getSessionCwd: () => '/tmp',
+    getOrCreateSessionForCwd: vi.fn(async () => 'acp-sess-0'),
+    prompt: vi.fn(async (
+      _acpSessionId: string,
+      content: ContentBlock[],
+      onUpdate?: (update: SessionUpdate) => void,
+    ) => {
       onPromptCalled?.(content)
       if (onUpdate) {
         onUpdate({
@@ -23,23 +33,22 @@ const createMockWorker = (promptResult?: PromptResponse, onPromptCalled?: (conte
     }),
     cancel: vi.fn(),
   } as unknown as AcpWorker
-
 }
 
 const createMockPool = (worker?: AcpWorker): AcpPool => {
   const mockWorker = worker ?? createMockWorker()
   return {
-    acquire: vi.fn(async () => mockWorker),
+    acquire: vi.fn(async () => ({ worker: mockWorker, acpSessionId: 'acp-sess-0' })),
     release: vi.fn(),
   } as unknown as AcpPool
 }
 
 const createMockSessionManager = (pool: AcpPool) => ({
   acquireForSession: vi.fn(async () => {
-    const worker = await (pool.acquire as ReturnType<typeof vi.fn>)()
-    return { worker, isExistingSession: false }
+    const lease = await (pool.acquire as ReturnType<typeof vi.fn>)('/tmp')
+    return { lease, isExistingSession: false, cacheHit: null }
   }),
-  releaseWorker: vi.fn(),
+  releaseLease: vi.fn(),
 })
 
 const createTestApp = (pool: AcpPool): express.Express => {
@@ -54,7 +63,7 @@ const makeRequest = async (
   app: express.Express,
   body: unknown,
 ): Promise<{ status: number; body: unknown }> => {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const server: Server = app.listen(0, () => {
       const address = server.address()
       const port = typeof address === 'object' && address ? address.port : 0
@@ -70,7 +79,7 @@ const makeRequest = async (
         })
         .catch((err) => {
           server.close()
-          throw err
+          reject(err)
         })
     })
   })
@@ -126,12 +135,18 @@ describe('POST /v1/messages non-streaming', () => {
     expect(data.content[0]!.text).toBe('test response')
   })
 
-  it('returns 529 when pool has no workers', async () => {
-    const pool = {
+  it('returns 529 when pool acquire fails', async () => {
+    const failingPool = {
       acquire: vi.fn(async () => { throw new Error('No workers') }),
       release: vi.fn(),
     } as unknown as AcpPool
-    const app = createTestApp(pool)
+    const failingSm = {
+      acquireForSession: vi.fn(async () => { throw new Error('No workers') }),
+      releaseLease: vi.fn(),
+    } as any
+    const app = express()
+    app.use(express.json())
+    app.use(createMessagesRouter({ pool: failingPool, sessionManager: failingSm }))
     const actual = await makeRequest(app, {
       model: 'kiro',
       messages: [{ role: 'user', content: 'hello' }],
@@ -142,45 +157,78 @@ describe('POST /v1/messages non-streaming', () => {
 })
 
 describe('POST /v1/messages streaming', () => {
-  it('returns SSE events', async () => {
-    const pool = createMockPool()
-    const app = createTestApp(pool)
-    const responseText = await new Promise<string>((resolve) => {
+  const fetchSse = (app: express.Express, body: unknown): Promise<{ headers: Record<string, string>; text: string }> => {
+    return new Promise((resolve, reject) => {
       const server: Server = app.listen(0, () => {
         const address = server.address()
         const port = typeof address === 'object' && address ? address.port : 0
         fetch(`http://127.0.0.1:${port}/v1/messages`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'kiro',
-            messages: [{ role: 'user', content: 'hello' }],
-            max_tokens: 1024,
-            stream: true,
-          }),
+          body: JSON.stringify(body),
         })
           .then(async (res) => {
             const text = await res.text()
+            const headers = Object.fromEntries(res.headers.entries())
             server.close()
-            resolve(text)
+            resolve({ headers, text })
           })
-          .catch((err) => {
-            server.close()
-            throw err
-          })
+          .catch((err) => { server.close(); reject(err) })
       })
     })
-    expect(responseText).toContain('event: message_start')
-    expect(responseText).toContain('event: message_stop')
+  }
+
+  it('returns SSE events', async () => {
+    const pool = createMockPool()
+    const app = createTestApp(pool)
+    const { text } = await fetchSse(app, {
+      model: 'kiro',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 1024,
+      stream: true,
+    })
+    expect(text).toContain('event: message_start')
+    expect(text).toContain('event: message_stop')
+  })
+
+  it('includes content_block_start/stop and message_delta', async () => {
+    const pool = createMockPool()
+    const app = createTestApp(pool)
+    const { text } = await fetchSse(app, {
+      model: 'kiro',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 1024,
+      stream: true,
+    })
+    expect(text).toContain('event: content_block_start')
+    expect(text).toContain('event: content_block_delta')
+    expect(text).toContain('event: content_block_stop')
+    expect(text).toContain('event: message_delta')
+  })
+
+  it('returns SSE headers', async () => {
+    const pool = createMockPool()
+    const app = createTestApp(pool)
+    const { headers } = await fetchSse(app, {
+      model: 'kiro',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 1024,
+      stream: true,
+    })
+    expect(headers['content-type']).toBe('text/event-stream')
+    expect(headers['cache-control']).toBe('no-cache')
   })
 })
 
-describe('POST /v1/messages non-streaming error handling', () => {
+describe('POST /v1/messages error handling', () => {
   it('returns 500 when worker prompt throws', async () => {
     const errorWorker = {
       id: 0,
-      getState: () => 'busy',
-      setState: vi.fn(),
+      isReady: () => true,
+      isDead: () => false,
+      hasCapacity: () => true,
+      getSessionCwd: () => '/tmp',
+      getOrCreateSessionForCwd: vi.fn(async () => 'acp-sess-0'),
       prompt: vi.fn(async () => { throw new Error('ACP connection lost') }),
       cancel: vi.fn(),
     } as unknown as AcpWorker
@@ -193,65 +241,5 @@ describe('POST /v1/messages non-streaming error handling', () => {
     })
     expect(actual.status).toBe(500)
     expect((actual.body as { error: { type: string } }).error.type).toBe('api_error')
-  })
-})
-
-describe('POST /v1/messages streaming details', () => {
-  it('includes content_block_start and content_block_stop events', async () => {
-    const pool = createMockPool()
-    const app = createTestApp(pool)
-    const responseText = await new Promise<string>((resolve) => {
-      const server: Server = app.listen(0, () => {
-        const address = server.address()
-        const port = typeof address === 'object' && address ? address.port : 0
-        fetch(`http://127.0.0.1:${port}/v1/messages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'kiro',
-            messages: [{ role: 'user', content: 'hello' }],
-            max_tokens: 1024,
-            stream: true,
-          }),
-        })
-          .then(async (res) => {
-            const text = await res.text()
-            server.close()
-            resolve(text)
-          })
-      })
-    })
-    expect(responseText).toContain('event: content_block_start')
-    expect(responseText).toContain('event: content_block_delta')
-    expect(responseText).toContain('event: content_block_stop')
-    expect(responseText).toContain('event: message_delta')
-  })
-
-  it('returns SSE headers', async () => {
-    const pool = createMockPool()
-    const app = createTestApp(pool)
-    const headers = await new Promise<Record<string, string>>((resolve) => {
-      const server: Server = app.listen(0, () => {
-        const address = server.address()
-        const port = typeof address === 'object' && address ? address.port : 0
-        fetch(`http://127.0.0.1:${port}/v1/messages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'kiro',
-            messages: [{ role: 'user', content: 'hello' }],
-            max_tokens: 1024,
-            stream: true,
-          }),
-        })
-          .then(async (res) => {
-            await res.text()
-            server.close()
-            resolve(Object.fromEntries(res.headers.entries()))
-          })
-      })
-    })
-    expect(headers['content-type']).toBe('text/event-stream')
-    expect(headers['cache-control']).toBe('no-cache')
   })
 })

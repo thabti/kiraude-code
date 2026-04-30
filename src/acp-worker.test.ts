@@ -3,9 +3,11 @@ import AcpWorker, { buildSpawnArgs } from './acp-worker.js'
 
 describe('AcpWorker', () => {
   describe('constructor and state management', () => {
-    it('initializes with idle state', () => {
+    it('initializes with initializing state', () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
-      expect(worker.getState()).toBe('idle')
+      expect(worker.getState()).toBe('initializing')
+      expect(worker.isReady()).toBe(false)
+      expect(worker.isDead()).toBe(false)
     })
 
     it('stores the worker id', () => {
@@ -13,17 +15,15 @@ describe('AcpWorker', () => {
       expect(worker.id).toBe(42)
     })
 
-    it('returns null sessionId before init', () => {
+    it('reports zero sessions before init', () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
-      expect(worker.getSessionId()).toBeNull()
+      expect(worker.getSessionCount()).toBe(0)
+      expect(worker.getInFlightCount()).toBe(0)
     })
 
-    it('allows setting state', () => {
+    it('hasCapacity is false before init', () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
-      worker.setState('busy')
-      expect(worker.getState()).toBe('busy')
-      worker.setState('dead')
-      expect(worker.getState()).toBe('dead')
+      expect(worker.hasCapacity()).toBe(false)
     })
   })
 
@@ -31,40 +31,40 @@ describe('AcpWorker', () => {
     it('sets state to dead', () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
       worker.kill()
-      expect(worker.getState()).toBe('dead')
+      expect(worker.isDead()).toBe(true)
     })
 
-    it('clears sessionId', () => {
+    it('clears all sessions', () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
       worker.kill()
-      expect(worker.getSessionId()).toBeNull()
+      expect(worker.getSessionCount()).toBe(0)
     })
 
     it('can be called multiple times safely', () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
       worker.kill()
       worker.kill()
-      expect(worker.getState()).toBe('dead')
+      expect(worker.isDead()).toBe(true)
     })
   })
 
   describe('prompt without init', () => {
     it('throws when not initialized', async () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
-      await expect(worker.prompt([{ type: 'text', text: 'hello' }])).rejects.toThrow('not initialized')
+      await expect(worker.prompt('s1', [{ type: 'text', text: 'hello' }])).rejects.toThrow('not initialized')
     })
 
     it('throws when dead', async () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
-      worker.setState('dead')
-      await expect(worker.prompt([{ type: 'text', text: 'hello' }])).rejects.toThrow('not initialized')
+      worker.kill()
+      await expect(worker.prompt('s1', [{ type: 'text', text: 'hello' }])).rejects.toThrow(/dead|not initialized/)
     })
   })
 
   describe('cancel without init', () => {
     it('resolves silently when not initialized', async () => {
       const worker = new AcpWorker({ id: 0, kiroCli: 'kiro-cli', cwd: '/tmp' })
-      await expect(worker.cancel()).resolves.toBeUndefined()
+      await expect(worker.cancel('unknown-session')).resolves.toBeUndefined()
     })
   })
 })

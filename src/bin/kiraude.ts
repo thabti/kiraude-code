@@ -4,11 +4,14 @@ import { createServer } from 'node:http'
 import express from 'express'
 import type { Request, Response, NextFunction } from 'express'
 import { pinoHttp } from 'pino-http'
-import logger from '../logger.js'
+import logger, { httpLogger } from '../logger.js'
 import AcpPool from '../pool.js'
 import SessionManager from '../session-manager.js'
 import createMessagesRouter from '../routes/messages.js'
 import createModelsRouter from '../routes/models.js'
+import { printBanner } from '../banner.js'
+import createBootstrapRouter from '../routes/bootstrap.js'
+import rateLimitHeaders from '../middleware/rate-limit-headers.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3456', 10)
 const POOL_SIZE = parseInt(process.env['POOL_SIZE'] ?? '2', 10)
@@ -24,7 +27,7 @@ const findClaude = (): string | null => {
 
 const startServer = async (): Promise<void> => {
   const app = express()
-  app.use(pinoHttp({ logger, autoLogging: false }))
+  app.use(pinoHttp({ logger: httpLogger, autoLogging: false }))
   app.use((_req: Request, res: Response, next: NextFunction): void => {
     res.setHeader('Access-Control-Allow-Origin', '*')
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -45,8 +48,10 @@ const startServer = async (): Promise<void> => {
     res.json({ status: 'ok' })
   })
 
+  app.use(rateLimitHeaders)
   app.use(createMessagesRouter({ pool, sessionManager }))
   app.use(createModelsRouter())
+  app.use(createBootstrapRouter())
 
   await pool.init()
   sessionManager.startCleanup()
@@ -78,8 +83,7 @@ const main = async (): Promise<void> => {
 
   console.log(`Starting kiraude proxy on port ${PORT}...`)
   await startServer()
-  console.log(`Proxy ready. Launching claude...`)
-  console.log()
+  printBanner(PORT, POOL_SIZE)
 
   const child = spawn(claudePath, process.argv.slice(2), {
     stdio: 'inherit',
@@ -87,7 +91,14 @@ const main = async (): Promise<void> => {
       ...process.env,
       ANTHROPIC_BASE_URL: `http://localhost:${PORT}`,
       ANTHROPIC_API_KEY: 'sk-ant-dummy',
+      // Disable experimental betas that may cause issues with proxy
       CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
+      // Disable fast mode entirely (prevents cooldown/degradation cycles)
+      CLAUDE_CODE_DISABLE_FAST_MODE: '1',
+      // Max effort by default
+      CLAUDE_CODE_EFFORT_LEVEL: 'high',
+      // Disable telemetry to avoid calls to Anthropic endpoints
+      CLAUDE_CODE_DISABLE_TELEMETRY: '1',
     },
   })
 

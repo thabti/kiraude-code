@@ -1,5 +1,7 @@
 import crypto from 'node:crypto'
 import type { ContentBlock, SessionUpdate, PromptResponse } from '@agentclientprotocol/sdk'
+import { buildPersonaPrefix } from './persona.js'
+import { renderToolCallStart, renderToolCallUpdate, renderPlan, type ToolCallState, type ToolCallStartLike, type ToolCallUpdateLike } from './tool-renderer.js'
 
 interface AnthropicMessage {
   readonly role: string
@@ -106,6 +108,8 @@ interface AnthropicResponse {
   readonly usage: {
     readonly input_tokens: number
     readonly output_tokens: number
+    readonly cache_creation_input_tokens?: number
+    readonly cache_read_input_tokens?: number
   }
 }
 
@@ -118,6 +122,10 @@ interface AnthropicThinkingBlock {
 
 interface CollectedUpdate {
   readonly update: SessionUpdate
+}
+
+interface CacheHitInfo {
+  readonly prefixTokens: number
 }
 
 const CHARS_PER_TOKEN = 4
@@ -133,6 +141,31 @@ const SYSTEM_TOOL_TYPES = new Set([
 ])
 
 const estimateTokens = (text: string): number => Math.ceil(text.length / CHARS_PER_TOKEN)
+
+/** Single-pass char count of all input text in a request. */
+const countInputChars = (request: AnthropicRequest): number => {
+  let chars = 0
+  for (const msg of request.messages) {
+    if (typeof msg.content === 'string') {
+      chars += msg.content.length
+    } else {
+      for (const block of msg.content) {
+        if (block.type === 'text') chars += block.text.length
+      }
+    }
+  }
+  if (request.system) {
+    if (typeof request.system === 'string') {
+      chars += request.system.length
+    } else {
+      for (const b of request.system) chars += b.text.length
+    }
+  }
+  return chars
+}
+
+const estimateInputTokensFromRequest = (request: AnthropicRequest): number =>
+  Math.ceil(countInputChars(request) / CHARS_PER_TOKEN)
 
 /** Extract the working directory from Claude Code's system prompt. */
 const extractCwdFromRequest = (request: AnthropicRequest): string | null => {
@@ -160,11 +193,14 @@ const buildToolContextBlock = (tools: ReadonlyArray<AnthropicTool>): ContentBloc
   return { type: 'text', text: `Available tools:\n${lines.join('\n')}` }
 }
 
+const filterUserTools = (tools: ReadonlyArray<AnthropicTool>): AnthropicTool[] =>
+  tools.filter((t) => !isSystemTool(t) && t.name)
+
 /**
  * Converts an Anthropic request to ACP content blocks.
  *
  * isExistingSession=true: only last user message (ACP session has prior context).
- * isExistingSession=false: full history concatenated with role prefixes.
+ * isExistingSession=false: persona + tool schemas + full history.
  */
 const toAcpPrompt = (request: AnthropicRequest, isExistingSession = false): Array<ContentBlock> => {
   const blocks: Array<ContentBlock> = []
@@ -178,14 +214,8 @@ const toAcpPrompt = (request: AnthropicRequest, isExistingSession = false): Arra
   }
 
   const systemText = extractSystemText(request)
-  if (systemText) {
-    blocks.push({ type: 'text', text: systemText })
-  }
-
-  if (request.tools && request.tools.length > 0) {
-    const toolBlock = buildToolContextBlock(request.tools)
-    if (toolBlock) blocks.push(toolBlock)
-  }
+  const personaPrefix = buildPersonaPrefix(request, systemText)
+  blocks.push({ type: 'text', text: personaPrefix })
 
   for (const message of request.messages) {
     const contentBlocks = convertMessageContent(message.content)
@@ -247,10 +277,18 @@ const convertSingleBlock = (block: AnthropicContentBlock): ContentBlock => {
     const text = typeof block.content === 'string'
       ? block.content
       : block.content.map((b) => b.text).join('\n')
-    return { type: 'text', text: `[Tool Result for ${block.tool_use_id}]: ${text}` }
+    // Frame as authoritative outcome so kiro treats it as ground truth
+    // instead of trying to re-execute the tool.
+    return {
+      type: 'text',
+      text: `<<tool_result tool_use_id="${block.tool_use_id}">>\n${text}\n<<end_tool_result>>\nThe tool ran successfully on the client. Treat this as ground truth.`,
+    }
   }
   if (block.type === 'tool_use') {
-    return { type: 'text', text: `[Tool Use: ${block.name}(${JSON.stringify(block.input)})]` }
+    return {
+      type: 'text',
+      text: `<<tool_use tool_use_id="${block.id}" name="${block.name}">>\n${JSON.stringify(block.input)}\n<<end_tool_use>>`,
+    }
   }
   if (block.type === 'document') {
     const title = block.title ? `[Document: ${block.title}]\n` : '[Document]\n'
@@ -266,70 +304,68 @@ const toAnthropicMessage = (
   updates: ReadonlyArray<CollectedUpdate>,
   promptResponse: PromptResponse,
   request: AnthropicRequest,
+  options?: { inputTokens?: number; cacheHit?: CacheHitInfo | null },
 ): AnthropicResponse => {
   const content: AnthropicResponseBlock[] = []
-  let inputText = ''
-  for (const msg of request.messages) {
-    if (typeof msg.content === 'string') {
-      inputText += msg.content
-    } else {
-      for (const block of msg.content) {
-        if (block.type === 'text') inputText += block.text
-      }
-    }
-  }
-  if (request.system) {
-    inputText += typeof request.system === 'string'
-      ? request.system
-      : request.system.map((b) => b.text).join('\n')
-  }
+  const inputTokens = options?.inputTokens ?? estimateInputTokensFromRequest(request)
+  const cacheReadTokens = options?.cacheHit?.prefixTokens ?? 0
 
   let outputText = ''
   let thinkingText = ''
-  const toolCalls: Map<string, { title: string; toolCallId: string; input: unknown }> = new Map()
+  const toolCalls: Map<string, ToolCallState> = new Map()
+  let lastPlanRendered = ''
 
   for (const { update } of updates) {
     if (update.sessionUpdate === 'agent_message_chunk') {
       const block = update.content
-      if (block.type === 'text') {
-        outputText += block.text
-      }
+      if (block.type === 'text') outputText += block.text
     }
     if (update.sessionUpdate === 'agent_thought_chunk') {
       thinkingText += (update.content as { thought?: string }).thought ?? ''
     }
     if (update.sessionUpdate === 'tool_call') {
-      toolCalls.set(update.toolCallId, {
-        title: update.title,
-        toolCallId: update.toolCallId,
-        input: update.rawInput ?? {},
+      const call = update as unknown as ToolCallStartLike
+      const rendered = renderToolCallStart(call)
+      toolCalls.set(call.toolCallId, {
+        toolCallId: call.toolCallId,
+        blockIndex: null,
+        rendered,
+        status: call.status ?? 'pending',
       })
     }
     if (update.sessionUpdate === 'tool_call_update') {
-      const existing = toolCalls.get(update.toolCallId)
-      if (existing && update.rawInput !== undefined) {
-        toolCalls.set(update.toolCallId, { ...existing, input: update.rawInput })
+      const upd = update as unknown as ToolCallUpdateLike
+      const prev = toolCalls.get(upd.toolCallId)
+      if (prev) {
+        const { rendered, status } = renderToolCallUpdate(prev, upd)
+        prev.rendered = rendered
+        prev.status = status
+      } else {
+        const rendered = renderToolCallStart(upd)
+        toolCalls.set(upd.toolCallId, {
+          toolCallId: upd.toolCallId,
+          blockIndex: null,
+          rendered,
+          status: upd.status ?? 'pending',
+        })
       }
+    }
+    if (update.sessionUpdate === 'plan') {
+      const entries = (update as unknown as { entries: Array<{ content: string; status: string; priority?: string }> }).entries
+      lastPlanRendered = renderPlan(entries ?? [])
     }
   }
 
   if (thinkingText.length > 0) {
     content.push({ type: 'thinking', thinking: thinkingText })
   }
-  if (outputText.length > 0) {
-    content.push({ type: 'text', text: outputText })
-  }
-  for (const [, tc] of toolCalls) {
-    content.push({
-      type: 'tool_use',
-      id: tc.toolCallId,
-      name: tc.title,
-      input: tc.input,
-    })
+  const toolText = Array.from(toolCalls.values()).map((s) => s.rendered).join('\n')
+  const combinedText = [outputText, toolText, lastPlanRendered].filter((s) => s.length > 0).join('\n\n')
+  if (combinedText.length > 0) {
+    content.push({ type: 'text', text: combinedText })
   }
 
-  const hasToolUse = content.some((b) => b.type === 'tool_use')
-  const stopReason = mapStopReason(promptResponse.stopReason, hasToolUse)
+  const stopReason = mapStopReason(promptResponse.stopReason, false)
 
   return {
     id: `msg_${crypto.randomUUID().replace(/-/g, '')}`,
@@ -340,8 +376,10 @@ const toAnthropicMessage = (
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
-      input_tokens: estimateTokens(inputText),
-      output_tokens: estimateTokens(outputText),
+      input_tokens: Math.max(0, inputTokens - cacheReadTokens),
+      output_tokens: estimateTokens(combinedText),
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: cacheReadTokens,
     },
   }
 }
@@ -353,7 +391,15 @@ const mapStopReason = (acpReason: string, hasToolUse: boolean): string => {
   return 'end_turn'
 }
 
-export { toAcpPrompt, toAnthropicMessage, estimateTokens, mapStopReason, extractCwdFromRequest }
+export {
+  toAcpPrompt,
+  toAnthropicMessage,
+  estimateTokens,
+  estimateInputTokensFromRequest,
+  countInputChars,
+  mapStopReason,
+  extractCwdFromRequest,
+}
 export type {
   AnthropicRequest,
   AnthropicResponse,
@@ -371,4 +417,5 @@ export type {
   AnthropicTool,
   AnthropicThinking,
   CollectedUpdate,
+  CacheHitInfo,
 }
