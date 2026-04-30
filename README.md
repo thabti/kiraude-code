@@ -1,5 +1,15 @@
 # kiraude
 
+```
+  ██╗  ██╗██╗██████╗  █████╗ ██╗   ██╗██████╗ ███████╗
+  ██║ ██╔╝██║██╔══██╗██╔══██╗██║   ██║██╔══██╗██╔════╝
+  █████╔╝ ██║██████╔╝███████║██║   ██║██║  ██║█████╗
+  ██╔═██╗ ██║██╔══██╗██╔══██║██║   ██║██║  ██║██╔══╝
+  ██║  ██╗██║██║  ██║██║  ██║╚██████╔╝██████╔╝███████╗
+  ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝
+                                                  v0.1.0
+```
+
 Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) powered by [Kiro CLI](https://kiro.dev). One command, zero config.
 
 ```bash
@@ -127,6 +137,8 @@ The API key value is ignored; the server does not validate it.
 | `KIRO_MCP_SERVERS_JSON` |         | Inline JSON array of MCP server configs forwarded to kiro on session start. |
 | `KIRO_MCP_SERVERS_FILE` |         | Path to JSON file with MCP server configs (alternative to `KIRO_MCP_SERVERS_JSON`). |
 | `LOG_LEVEL`          | `info`     | Pino log level (`debug`, `info`, `warn`, `error`) |
+| `RESPONSE_LOG_LEVEL` | `silent`   | Log level for response body logging |
+| `HTTP_LOG_LEVEL`     | `silent`   | Log level for HTTP request/response logging |
 | `LOG_REQUEST_BODIES` |            | Set `true` to log full request/response bodies to file |
 
 ### Permission handling
@@ -211,7 +223,7 @@ PORT=4000 npx kiraude
 Increase the pool size for concurrent requests:
 
 ```bash
-POOL_SIZE=4 npx kiraude
+POOL_SIZE=8 npx kiraude
 ```
 
 ### Verbose logging
@@ -264,6 +276,16 @@ pm2 logs kiraude    # tail logs
 curl -s http://localhost:3456/health | jq .
 ```
 
+## CC tool emulation
+
+When `EMULATE_CC_TOOLS=true` (default), the proxy synthesizes Anthropic `tool_use` blocks for every kiro ACP `tool_call`. Tool names are prefixed `kiro_*` (e.g. `kiro_Edit`, `kiro_Bash`, `kiro_Read`) so Claude Code renders rich diffs and file edits without re-executing the action — kiro already ran it.
+
+A parallel text-rendered block (formatted diff, fenced bash output) is also emitted for immediate visual feedback.
+
+`TodoWrite` is emitted un-prefixed since it is a no-op state writer safe to execute client-side.
+
+Set `EMULATE_CC_TOOLS=false` for plain text rendering only.
+
 ## Security
 
 This proxy is designed for **local development only**.
@@ -292,4 +314,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 MIT
 
-Copyright © 2025 Sabeur Thabti
+Copyright © 2026 Sabeur Thabti
