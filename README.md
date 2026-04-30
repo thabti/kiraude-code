@@ -8,6 +8,27 @@
                                                   v0.1.0
 
 
+**Hit the Claude Code limit?**
+
+```
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  Press Ctrl-C again to exit                            ● high · /effort
+
+Resume this session with:
+claude --resume cdf490db-8d81-4019-b27a-91b3911beae9
+```
+
+You can resume right where you left off — just prefix with your kiraude proxy:
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:3456 ANTHROPIC_API_KEY=sk-ant-dummy \
+  claude --resume cdf490db-8d81-4019-b27a-91b3911beae9
+```
+
+---
+
 Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) powered by [Kiro CLI](https://kiro.dev). One command, zero config.
 
 ```bash
