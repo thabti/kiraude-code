@@ -13,7 +13,7 @@ import { printBanner } from '../banner.js'
 import createBootstrapRouter from '../routes/bootstrap.js'
 import rateLimitHeaders from '../middleware/rate-limit-headers.js'
 
-const portArgIdx = process.argv.indexOf('--port')
+const portArgIdx = ['--port', '-p'].reduce((idx, flag) => idx !== -1 ? idx : process.argv.indexOf(flag), -1)
 const portArg = portArgIdx !== -1 ? process.argv[portArgIdx + 1] : undefined
 const PORT = parseInt(portArg ?? process.env['PORT'] ?? '3456', 10)
 if (portArgIdx !== -1) process.argv.splice(portArgIdx, 2)
