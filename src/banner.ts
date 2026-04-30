@@ -29,7 +29,7 @@ ${RESET}
   ${CYAN}▸${RESET} ${BOLD}Workers${RESET}   ${YELLOW}${poolSize}${RESET}
 
   ${DIM}Connect Claude Code:${RESET}
-  ${CYAN}ANTHROPIC_BASE_URL=${url} ANTHROPIC_API_KEY=sk-ant-dumy claude${RESET}
+  ${CYAN}ANTHROPIC_BASE_URL=${url} ANTHROPIC_API_KEY=sk-ant-dummy claude${RESET}
 `
   console.log(art)
 }

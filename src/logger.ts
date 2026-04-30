@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import pino from 'pino'
+import pretty from 'pino-pretty'
 
 const LOG_DIR = join(process.cwd(), 'logs')
 const LOG_LEVEL = process.env['LOG_LEVEL'] ?? 'info'
@@ -22,9 +23,15 @@ const asyncDest = (path: string): pino.DestinationStream =>
 const createLogger = (): pino.Logger => {
   mkdirSync(LOG_DIR, { recursive: true })
   const date = formatDate()
+  const stdoutStream = process.stdout.isTTY
+    ? pretty({ colorize: true, translateTime: 'HH:MM:ss', ignore: 'pid,hostname' })
+    : process.stdout
+  const stderrStream = process.stderr.isTTY
+    ? pretty({ colorize: true, translateTime: 'HH:MM:ss', ignore: 'pid,hostname', destination: 2 })
+    : process.stderr
   const streams: pino.StreamEntry[] = [
-    { level: 'info', stream: process.stdout },
-    { level: 'error', stream: process.stderr },
+    { level: 'info', stream: stdoutStream },
+    { level: 'error', stream: stderrStream },
     { level: 'trace', stream: asyncDest(join(LOG_DIR, `app-${date}.log`)) },
     { level: 'error', stream: asyncDest(join(LOG_DIR, `error-${date}.log`)) },
   ]

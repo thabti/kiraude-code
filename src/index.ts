@@ -94,10 +94,12 @@ const shutdown = async (signal: string): Promise<void> => {
   process.exit(0)
 }
 
+printBanner(PORT, POOL_SIZE)
+
 pool.init().then(() => {
   sessionManager.startCleanup()
   server = app.listen(PORT, () => {
-    printBanner(PORT, POOL_SIZE)
+    logger.info({ port: PORT }, 'http server listening')
   })
 }).catch((err) => {
   logger.fatal({ err }, 'failed to initialize pool')
