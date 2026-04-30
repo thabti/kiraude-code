@@ -1,6 +1,6 @@
 {
   "name": "kiraude",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "description": "Run Claude Code powered by Kiro CLI — one command, zero config",
   "type": "module",
   "main": "dist/index.js",
