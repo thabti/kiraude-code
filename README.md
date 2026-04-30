@@ -44,6 +44,10 @@ src/
 ├── persona.ts                      # Builds persona/instructions prefix for new ACP sessions
 ├── prompt-cache.ts                 # PromptCacheRegistry — prefix hash → ACP session ID
 ├── tool-renderer.ts                # Renders ACP tool_call/plan updates into markdown for SSE
+├── tool-synth.ts                   # Synthesizes Anthropic tool_use blocks from ACP tool_call updates
+├── recap.ts                        # Builds TodoWrite plan entries from ACP plan updates
+├── mcp-config.ts                   # Loads MCP server config for kiro ACP sessions
+├── utils.ts                        # Shared utilities (unreachable, etc.)
 ├── logger.ts                       # Pino logger setup
 ├── bin/kiraude.ts                  # CLI: starts proxy, launches claude
 ├── middleware/
@@ -113,11 +117,17 @@ The API key value is ignored; the server does not validate it.
 | Environment variable | Default    | Description                           |
 |----------------------|------------|---------------------------------------|
 | `PORT`               | `3456`     | HTTP server listen port               |
-| `POOL_SIZE`          | `5`        | Number of concurrent kiro-cli workers |
+| `POOL_SIZE`          | `4`        | Number of concurrent kiro-cli workers |
+| `MAX_SESSIONS_PER_WORKER` | `8`   | ACP sessions multiplexed per worker   |
+| `HOT_SPARE`          | `true`     | Keep one extra pre-warmed worker      |
 | `KIRO_CLI_PATH`      | `kiro-cli` | Path to kiro-cli binary               |
 | `TRUST_ALL_TOOLS`    | `true`     | Pass `--trust-all-tools` to kiro-cli. Set to `false` to disable. |
 | `TRUST_TOOLS`        |            | Comma-separated tool names for `--trust-tools`. Overrides `TRUST_ALL_TOOLS`. |
+| `EMULATE_CC_TOOLS`   | `true`     | Synthesize `kiro_*` tool_use blocks so Claude Code renders diffs/edits. Set to `false` for plain text only. |
+| `KIRO_MCP_SERVERS_JSON` |         | Inline JSON array of MCP server configs forwarded to kiro on session start. |
+| `KIRO_MCP_SERVERS_FILE` |         | Path to JSON file with MCP server configs (alternative to `KIRO_MCP_SERVERS_JSON`). |
 | `LOG_LEVEL`          | `info`     | Pino log level (`debug`, `info`, `warn`, `error`) |
+| `LOG_REQUEST_BODIES` |            | Set `true` to log full request/response bodies to file |
 
 ### Permission handling
 
@@ -174,6 +184,7 @@ The full alias map is in `src/kiro-models.ts`.
 | Client disconnect handling | ✅ |
 | Keepalive pings | ✅ |
 | Dead worker auto-replacement | ✅ |
+| MCP server forwarding | ✅ |
 
 ## Troubleshooting
 
