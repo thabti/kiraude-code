@@ -381,7 +381,11 @@ const toAnthropicMessage = (
   for (const { update } of updates) {
     if (update.sessionUpdate === 'agent_message_chunk') {
       const block = update.content
-      if (block.type === 'text') outputText += block.text
+      if (block.type === 'text') {
+        // Filter out Minimax/DeepSeek special tokens like <｜DSML｜function_calls>
+        const cleaned = block.text.replace(/<｜[^｜]+｜\w+>/g, '')
+        outputText += cleaned
+      }
     }
     if (update.sessionUpdate === 'agent_thought_chunk') {
       thinkingText += (update.content as { thought?: string }).thought ?? ''

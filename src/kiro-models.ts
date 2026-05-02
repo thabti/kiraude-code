@@ -47,6 +47,9 @@ const ALIAS_MAP: Record<string, string> = {
   'kiro-opus': 'claude-opus-4.6',
   'kiro-sonnet': 'claude-sonnet-4.6',
   'kiro-haiku': 'claude-haiku-4.5',
+  // third-party model families
+  'minimax': 'minimax',
+  'deepseek': 'deepseek',
 }
 
 const MODEL_CREATED_TIMESTAMP = 1700000000
@@ -116,11 +119,44 @@ function buildAnthropicModelList(kiroModels: KiroModel[]): AnthropicModelEntry[]
  * Falls back to the Kiro default ('auto') if no mapping found.
  */
 export function resolveKiroModelId(requestedModel: string): string {
-  // Direct alias lookup
-  if (ALIAS_MAP[requestedModel]) return ALIAS_MAP[requestedModel]!
+  // Direct alias lookup (fallback if no cached models)
+  if (ALIAS_MAP[requestedModel] && !cachedKiroModels) return ALIAS_MAP[requestedModel]!
 
-  // Dot-notation exact match in cached Kiro models
+  // Dynamic alias resolution from fetched Kiro models
   if (cachedKiroModels) {
+    // Map short aliases to model family prefixes
+    const aliasToFamily: Record<string, string> = {
+      'sonnet': 'claude-sonnet',
+      'opus': 'claude-opus',
+      'haiku': 'claude-haiku',
+      'kiro-sonnet': 'claude-sonnet',
+      'kiro-opus': 'claude-opus',
+      'kiro-haiku': 'claude-haiku',
+      'minimax': 'minimax',
+      'deepseek': 'deepseek',
+    }
+
+    const family = aliasToFamily[requestedModel]
+    if (family) {
+      // Find the latest version of this family (highest numeric suffix)
+      const familyModels = cachedKiroModels
+        .filter((m) => m.model_id.startsWith(family))
+        .sort((a, b) => {
+          const parseVersion = (id: string) => {
+            const match = id.match(/(\d+)\.(\d+)$/)
+            return match ? [parseInt(match[1], 10), parseInt(match[2], 10)] : [0, 0]
+          }
+          const [aMajor, aMinor] = parseVersion(a.model_id)
+          const [bMajor, bMinor] = parseVersion(b.model_id)
+          return bMajor - aMajor || bMinor - aMinor
+        })
+
+      if (familyModels.length > 0) {
+        return familyModels[0]!.model_id
+      }
+    }
+
+    // Exact match in cached Kiro models
     const exact = cachedKiroModels.find((m) => m.model_id === requestedModel || m.model_name === requestedModel)
     if (exact) return exact.model_id
 
@@ -166,4 +202,6 @@ const FALLBACK_MODELS: AnthropicModelEntry[] = [
   { id: 'sonnet',             object: 'model', created: MODEL_CREATED_TIMESTAMP, owned_by: 'kiro' },
   { id: 'opus',               object: 'model', created: MODEL_CREATED_TIMESTAMP, owned_by: 'kiro' },
   { id: 'haiku',              object: 'model', created: MODEL_CREATED_TIMESTAMP, owned_by: 'kiro' },
+  { id: 'minimax',            object: 'model', created: MODEL_CREATED_TIMESTAMP, owned_by: 'kiro' },
+  { id: 'deepseek',           object: 'model', created: MODEL_CREATED_TIMESTAMP, owned_by: 'kiro' },
 ]
